@@ -9,10 +9,10 @@
 # Attiva conda
 export PATH="/opt/anaconda/anaconda3/bin:$PATH"
 eval "$(conda shell.bash hook)"
-conda activate /home/ztesta/ztesta/conda_env_zeno
+conda activate /mnt/homeGPU/ztesta/conda_env_zeno
 
 # Vai nella repo
-cd /home/ztesta/ztesta/qwen3-vl-slt-how2sign/scripts
+cd /mnt/homeGPU/ztesta/qwen3-vl-slt-how2sign/scripts
 
 # Lancia il tuo script
 python smoke_test_qwen3vl.py

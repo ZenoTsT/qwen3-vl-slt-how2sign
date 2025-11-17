@@ -1,0 +1,7 @@
+torch
+torchvision
+transformers
+accelerate
+peft
+pillow
+pyyaml

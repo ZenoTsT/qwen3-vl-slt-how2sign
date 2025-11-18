@@ -15,17 +15,13 @@ docker run --gpus all --rm \
     -e HOME=/$USER \
     nvcr.io/nvidia/pytorch:21.02-py3 \
     bash -lc "
-      cd qwen3-vl-slt-how2sign && \
+      cd /$USER/qwen3-vl-slt-how2sign && \
       echo '>>> Aggiorno pip + typing_extensions' && \
       pip install --upgrade pip typing_extensions && \
-      echo '>>> Installo transformers da GitHub (main)' && \
-      pip uninstall -y transformers && \
-      pip install 'git+https://github.com/huggingface/transformers.git' && \
       echo '>>> Installo requirements del progetto' && \
       pip install -r requirements.txt && \
       echo '>>> Lancio smoke test' && \
       PYTHONPATH=. python scripts/smoke_test_qwen3vl.py
-    "
     "
 
 stop_rootless_docker.sh

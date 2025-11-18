@@ -10,11 +10,15 @@ module load rootless-docker
 start_rootless_docker.sh
 
 docker run --gpus all --rm \
-    --workdir /$USER \
     -v /mnt/homeGPU/$USER/:/$USER \
+    -w /$USER/qwen3-vl-slt-how2sign \
     -e HOME=/$USER \
     nvcr.io/nvidia/pytorch:21.02-py3 \
-    bash -lc "pip install -r qwen3-vl-slt-how2sign/requirements.txt && \
-              python qwen3-vl-slt-how2sign/scripts/smoke_test_qwen3vl.py"
+    bash -lc "
+      set -e
+      pip install -r requirements.txt
+      export PYTHONPATH=\$PYTHONPATH:/$USER/qwen3-vl-slt-how2sign
+      python scripts/smoke_test_qwen3vl.py
+    "
 
 stop_rootless_docker.sh

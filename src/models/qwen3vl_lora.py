@@ -1,5 +1,5 @@
 import torch
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoProcessor #, Qwen3VLForConditionalGeneration
 from peft import LoraConfig, get_peft_model
 
 
@@ -21,12 +21,20 @@ def load_qwen3vl_lora(                                      # ΔW ≈ A · B, wh
         trust_remote_code=True,
     )
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained(           # load the pretrained multimodal causal LM (text + vision)
+    # model = Qwen3VLForConditionalGeneration.from_pretrained(           # load the pretrained multimodal causal LM (text + vision)
+    #     model_name,
+    #     dtype=torch_dtype,
+    #     device_map=device_map,
+    #     attn_implementation="sdpa",
+    #     #attn_implementation="eager",
+    #     trust_remote_code=True,
+    # )
+    
+    model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
         device_map=device_map,
         attn_implementation="sdpa",
-        #attn_implementation="eager",
         trust_remote_code=True,
     )
 

@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor #, Qwen3VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from peft import LoraConfig, get_peft_model
 
 
@@ -14,29 +14,22 @@ def load_qwen3vl_lora(                                      # ΔW ≈ A · B, wh
     Load Qwen3-VL vision-language model with LoRA applied.
     """
 
-    torch_dtype = torch.float16                             # data type for model weights (fp16 to save memory)
+    #torch_dtype = torch.float16                             # data type for model weights (fp16 to save memory)
 
     processor = AutoProcessor.from_pretrained(              # load the multimodal processor (tokenizer + image processor, the "vocabulary" and preprocessing of the MLLM)
         model_name, 
         trust_remote_code=True,
     )
 
-    # model = Qwen3VLForConditionalGeneration.from_pretrained(           # load the pretrained multimodal causal LM (text + vision)
-    #     model_name,
-    #     dtype=torch_dtype,
-    #     device_map=device_map,
-    #     attn_implementation="sdpa",
-    #     #attn_implementation="eager",
-    #     trust_remote_code=True,
-    # )
-    
-    model = AutoModelForCausalLM.from_pretrained(
+    model = Qwen3VLForConditionalGeneration.from_pretrained(           # load the pretrained multimodal causal LM (text + vision)
         model_name,
-        torch_dtype=torch_dtype,
+        torch_dtype=torch.float16,
         device_map=device_map,
         attn_implementation="sdpa",
+        #attn_implementation="eager",
         trust_remote_code=True,
     )
+    
 
     # Config LoRA (for now only on attention projections, we will refine this later)
     # We will focus LoRA only on the layers that need it, not on all layers as now

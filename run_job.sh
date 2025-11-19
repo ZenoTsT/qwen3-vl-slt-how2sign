@@ -1,27 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=prova_qwen_docker
-#SBATCH --partition=dios
+#SBATCH --job-name=qwen3vl_slt
+#SBATCH --output=logs/train_%j.out
+#SBATCH --error=logs/train_%j.err
+#SBATCH --partition=all_usr_prod
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=20G
-#SBATCH --output=slurm-%j.out
+#SBATCH --mem=48G
+#SBATCH --time=10:00:00
 
-module load rootless-docker
-start_rootless_docker.sh
+# Carico anaconda (di solito già caricato, ma per sicurezza)
+module load anaconda3/2023.09-0-none-none
+module load cuda/12.6.3
+module load cudnn/9.8.0.87-12-none-none-cuda-12.6.3
 
-docker run --gpus all --rm \
-    --workdir /$USER \
-    -v /mnt/homeGPU/$USER/:/$USER \
-    -e HOME=/$USER \
-    nvcr.io/nvidia/pytorch:21.02-py3 \
-    bash -lc "
-      cd /$USER/qwen3-vl-slt-how2sign && \
-      echo '>>> Aggiorno pip + typing_extensions' && \
-      pip install --upgrade pip typing_extensions && \
-      echo '>>> Installo requirements del progetto' && \
-      pip install -r requirements.txt && \
-      echo '>>> Lancio smoke test' && \
-      PYTHONPATH=. python scripts/smoke_test_qwen3vl.py
-    "
+# Attivo l'env
+source activate qwen3vl_env
 
-stop_rootless_docker.sh
+# Mi sposto nella cartella del progetto
+cd /homes/ztesta/qwen3-vl-slt-how2sign
+
+# Creo la cartella logs se non esiste
+mkdir -p logs
+
+# LANCIO UN TEST LEGGERO PRIMA (smoke test)
+python scripts/smoke_test_qwen3vl.py

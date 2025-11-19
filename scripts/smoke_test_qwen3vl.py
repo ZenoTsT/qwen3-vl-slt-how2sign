@@ -24,9 +24,27 @@ def main():
     prompt = "You are a vision-language model. Describe what you see in this frame."
 
     # 4) Use the processor to prepare multimodal inputs (image + text)
+    
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+
+    # Applica il chat template -> inserisce automaticamente i token immagine
+    chat_text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    
     inputs = processor(
-        text=prompt,
-        images=[image],
+        text=[chat_text],    # lista di stringhe
+        images=[image],      # lista di immagini
         return_tensors="pt",
     ).to(model.device)
 
@@ -35,13 +53,15 @@ def main():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=64,
+            do_sample=False,
         )
 
     # 6) Decode the generated text
-    generated_text = processor.tokenizer.decode(
-        output_ids[0],
+    generated_text = processor.batch_decode(
+        output_ids,
         skip_special_tokens=True,
-    )
+    )[0]
+
     print("Generated:", generated_text)
 
 

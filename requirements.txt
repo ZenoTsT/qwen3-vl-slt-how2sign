@@ -5,3 +5,6 @@ accelerate
 peft
 pillow
 pyyaml
+imageio
+imageio-ffmpeg
+tqdm

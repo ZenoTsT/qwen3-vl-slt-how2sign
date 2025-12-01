@@ -1,0 +1,59 @@
+# ================================
+#  PROJECT-SPECIFIC IGNORE RULES
+# ================================
+
+# ---- Checkpoints & Training Artifacts ----
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# ---- SLURM logs ----
+logs/
+*.out
+*.err
+
+# ---- HuggingFace Cache ----
+.hf_cache/
+huggingface/
+.cache/
+
+# ---- Python cache ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+*/.python-version
+
+# ---- Local environment-specific ----
+*.log
+*.tmp
+*.bak
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- macOS trash ----
+.DS_Store
+
+# ---- Notebook hidden folders ----
+notebooks/.ipynb_checkpoints/
+
+# ---- Editor/IDE ----
+.vscode/
+.idea/
+
+# ---- Temporary run outputs ----
+runs/
+outputs/
+results/
+
+# ---- Model binaries of any kind ----
+*.bin
+*.safetensors
+*.msgpack

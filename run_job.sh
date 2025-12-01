@@ -2,13 +2,13 @@
 #SBATCH --job-name=qwen3vl_slt
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
-#SBATCH --account=cvcs2025
+#SBATCH --account=tesi_ztesta
 #SBATCH --partition=all_usr_prod
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
 #SBATCH --time=10:00:00
-#SBATCH --constraint=gpu_L40S_48G|gpu_A40_48G|gpu_RTXA5000_24G|gpu_RTX6000_24G
+#SBATCH --constraint=gpu_A40_45G|gpu_L40S_45G|gpu_RTX6000_24G|gpu_RTX_A5000_24G
 
 # Carico anaconda (di solito già caricato, ma per sicurezza)
 module load anaconda3/2023.09-0-none-none
@@ -26,4 +26,4 @@ export PYTHONPATH=/homes/ztesta/qwen3-vl-slt-how2sign:$PYTHONPATH
 mkdir -p logs
 
 # LANCIO UN TEST LEGGERO PRIMA (smoke test)
-python scripts/smoke_test_qwen3vl_multiple_frames.py
+python scripts/smoke_test_qwen3vl.py

@@ -35,7 +35,7 @@ def load_qwen3vl_lora(                                      # ΔW ≈ A · B, wh
     t2 = time.perf_counter()
     model = Qwen3VLForConditionalGeneration.from_pretrained(  # load the pretrained multimodal causal LM (text + vision)
         model_name,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map=device_map,
         attn_implementation="sdpa",
         # attn_implementation="eager",
@@ -44,36 +44,36 @@ def load_qwen3vl_lora(                                      # ΔW ≈ A · B, wh
     t3 = time.perf_counter()
     print(f"[TIMER] Base model loaded in {t3 - t2:.2f} seconds.")
 
-    # -----------------------------
-    # 3) Attach LoRA
-    # -----------------------------
-    t4 = time.perf_counter()
-    # Config LoRA (for now only on attention projections, we will refine this later)
-    lora_config = LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],    # we apply LoRA to queries, keys, values and outputs of attention
-        lora_dropout=dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
+    # # -----------------------------
+    # # 3) Attach LoRA
+    # # -----------------------------
+    # t4 = time.perf_counter()
+    # # Config LoRA (for now only on attention projections, we will refine this later)
+    # lora_config = LoraConfig(
+    #     r=r,
+    #     lora_alpha=alpha,
+    #     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],    # we apply LoRA to queries, keys, values and outputs of attention
+    #     lora_dropout=dropout,
+    #     bias="none",
+    #     task_type="CAUSAL_LM",
+    # )
 
-    model = get_peft_model(model, lora_config)              # wrap the base model with LoRA adapters
-    t5 = time.perf_counter()
-    print(f"[TIMER] LoRA adapters attached in {t5 - t4:.2f} seconds.")
+    # model = get_peft_model(model, lora_config)              # wrap the base model with LoRA adapters
+    # t5 = time.perf_counter()
+    # print(f"[TIMER] LoRA adapters attached in {t5 - t4:.2f} seconds.")
 
-    # Print how many parameters are trainable
-    trainable, total = 0, 0
-    for _, p in model.named_parameters():
-        total += p.numel()
-        if p.requires_grad:
-            trainable += p.numel()
-    print(
-        f"Trainable params: {trainable:,} / {total:,} "
-        f"({100 * trainable / total:.4f}%)"
-    )
+    # # Print how many parameters are trainable
+    # trainable, total = 0, 0
+    # for _, p in model.named_parameters():
+    #     total += p.numel()
+    #     if p.requires_grad:
+    #         trainable += p.numel()
+    # print(
+    #     f"Trainable params: {trainable:,} / {total:,} "
+    #     f"({100 * trainable / total:.4f}%)"
+    # )
 
-    # Total time for the whole loading pipeline
-    print(f"[TIMER] Total load_qwen3vl_lora() time: {t5 - t0:.2f} seconds.")
+    # # Total time for the whole loading pipeline
+    # print(f"[TIMER] Total load_qwen3vl_lora() time: {t5 - t0:.2f} seconds.")
 
     return model, processor

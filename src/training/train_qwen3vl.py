@@ -57,19 +57,20 @@ def build_instruction_prompt() -> str:
     Questo testo è quello che forniamo in input in fase di generazione.
     """
     
-    N_FRAMES_PER_CLIP = 16  # deve coincidere con n_frames_to_take del dataset
-    IMAGE_TOKEN_STR = "<|image_pad|>"
-    
-    # Ripeti il token immagine una volta per ogni frame del video
+    N_FRAMES_PER_CLIP = 16                  # deve coincidere con n_frames_to_take
+    IMAGE_TOKEN_STR = "<|image_pad|>"       # token placeholder immagine
+
+    # Crea "<|image_pad|> <|image_pad|> ... (16 volte)"
     image_tokens = " ".join([IMAGE_TOKEN_STR] * N_FRAMES_PER_CLIP)
-    
-    return (
-        "You are a sign language translation model. "
-        "Given the following sign language video frames {image_tokens}, "
-        "translate it into English.\n\n"
-        "Answer with the English sentence only.\n\n"
-        "Translation:"
+
+    prompt = (
+        f"You are a sign language translation model. "
+        f"Given the following sign language video frames {image_tokens}, "
+        f"translate it into English.\n\n"
+        f"Answer with the English sentence only.\n\n"
+        f"Translation:"
     )
+    return prompt
 
 
 def build_training_text(target_text: str) -> str:

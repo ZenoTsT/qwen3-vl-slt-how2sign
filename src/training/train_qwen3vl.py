@@ -9,7 +9,7 @@ from typing import Dict, Any, List
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.cuda.amp import GradScaler
+from torch import amp
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------
@@ -369,7 +369,7 @@ def main():
 
     # GradScaler
     if device.startswith("cuda"):
-        scaler = GradScaler(device="cuda")                      # serve a stabilizzare il gradiente allenando in float != 32
+        scaler = amp.GradScaler("cuda")                      # serve a stabilizzare il gradiente allenando in float != 32
     else:
         scaler = None  # su CPU non serve
 

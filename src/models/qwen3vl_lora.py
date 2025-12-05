@@ -45,7 +45,7 @@ def load_qwen3vl_lora(
     t2 = time.perf_counter()
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,     # fp16 per risparmiare memoria
+        dtype=torch.float16,     # fp16 per risparmiare memoria
         attn_implementation="sdpa",
         trust_remote_code=True,
     )

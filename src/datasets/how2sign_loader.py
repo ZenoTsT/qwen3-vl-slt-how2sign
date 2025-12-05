@@ -28,6 +28,7 @@ class How2SignDataset(Dataset):
         split: str = "train",                      # "train" | "val" | "test"
         n_frames_to_take: Optional[int] = 16,      # None = tutti i frame
         frame_sampling_strategy: str = "uniform",  # "uniform" | "consecutive" | "center" | "random"
+        root_dir: Optional[str] = None,
     ) -> None:
         super().__init__()                          # chiamo il costruttore della classe Dataset (per __getitem__ ecc ecc)
 
@@ -49,6 +50,15 @@ class How2SignDataset(Dataset):
 
         self.n_frames_to_take = n_frames_to_take
         self.frame_sampling_strategy = frame_sampling_strategy
+        
+        # rimposto un eventuale root dir
+        meta_root = self.meta.get("root_dir")
+        if root_dir is not None:
+            self.root_dir = Path(root_dir).resolve()
+        elif meta_root is not None:
+            self.root_dir = Path(meta_root).resolve()
+        else:
+            self.root_dir = self.json_path.parents[2]
 
         print(
             f"[How2SignDataset] split={self.split} | num_samples={len(self.entries)} | "

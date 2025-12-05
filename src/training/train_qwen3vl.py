@@ -58,7 +58,8 @@ def build_instruction_prompt() -> str:
     """
     return (
         "You are a sign language translation model. "
-        "Given the following sign language video, translate it into English.\n\n"
+        "Given the following sign language video frames <image>, "
+        "translate it into English.\n\n"
         "Answer with the English sentence only.\n\n"
         "Translation:"
     )

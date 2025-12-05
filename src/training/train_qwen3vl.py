@@ -15,10 +15,12 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------
 # PYTHONPATH: aggiungo la root del progetto
 # ---------------------------------------------------------------------
-THIS_DIR = Path(__file__).resolve().parent
-ROOT_DIR = THIS_DIR.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.append(str(ROOT_DIR))
+THIS_DIR = Path(__file__).resolve().parent          # .../src/training
+PROJECT_ROOT = THIS_DIR.parent.parent               # .../ (root del repo)
+SRC_ROOT = PROJECT_ROOT / "src"                     # .../src
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 from src.datasets.how2sign_loader import How2SignDataset, how2sign_collate_fn
 from src.models.qwen3vl_lora import load_qwen3vl_lora
@@ -28,8 +30,8 @@ from src.models.qwen3vl_lora import load_qwen3vl_lora
 # Config di base
 # ---------------------------------------------------------------------
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
-DATASET_JSON = ROOT_DIR / "data/How2Sign/how2sign_dataset.json"
-OUTPUT_DIR = ROOT_DIR / "outputs/qwen3vl_lora_how2sign"
+DATASET_JSON = PROJECT_ROOT / "data/How2Sign/how2sign_dataset.json"
+OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
 BATCH_SIZE = 1              # poi si prova ad alzare
 NUM_EPOCHS = 1              # per ora smoke test
@@ -340,7 +342,7 @@ def main():
         print("==============================================")
         print("   QWEN3-VL LoRA — HOW2SIGN TRAINING")
         print("==============================================\n")
-        print(f"[INFO] Root dir:       {ROOT_DIR}")
+        print(f"[INFO] Root dir:       {PROJECT_ROOT}")
         print(f"[INFO] Dataset JSON:   {DATASET_JSON}")
         print(f"[INFO] Output dir:     {OUTPUT_DIR}")
         print(f"[INFO] World size:     {world_size}")
@@ -379,12 +381,12 @@ def main():
     train_ds = How2SignDataset(             # Costruisco un oggetto Dataset per training
         json_path=str(DATASET_JSON),
         split="train",
-        root_dir=str(ROOT_DIR),
+        root_dir=str(PROJECT_ROOT),
     )
     val_ds = How2SignDataset(               # Costruisco un oggetto Dataset per validation
         json_path=str(DATASET_JSON),
         split="val",
-        root_dir=str(ROOT_DIR),
+        root_dir=str(PROJECT_ROOT),
     )
 
     if is_main_process:

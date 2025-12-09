@@ -92,6 +92,39 @@ def extract_frames_from_video(
             # Randomly sample `n_frames_to_take` distinct frame indices, using a Generator lets us optionally control reproducibility via `seed`.
             rng = np.random.default_rng(seed)
             indices = sorted(rng.choice(n_frames, size=n_frames_to_take, replace=False).tolist())
+        
+        elif strategy == "fps2_max32":
+            # Sample frames at ~2 fps with an upper bound of 32 frames per video.
+            max_frames = 32
+
+            # Try to read FPS from metadata
+            try:
+                meta = reader.get_meta_data()
+                fps = float(meta.get("fps", 0.0) or 0.0)
+            except Exception:
+                fps = 0.0
+
+            if fps <= 0.0:
+                # Fallback: behave roughly like uniform sampling capped at max_frames
+                if n_frames <= max_frames:
+                    indices = list(range(n_frames))
+                else:
+                    step = max(n_frames // max_frames, 1)
+                    indices = list(range(0, min(n_frames, step * max_frames), step))
+            else:
+                # Step in frames to get about 2 frames per second
+                step = max(fps / 2.0, 1.0)  # frames per sample
+                raw_indices = np.arange(0, n_frames, step, dtype=float)
+                # Convert to int, unique and sorted
+                indices = sorted({int(i) for i in raw_indices if 0 <= int(i) < n_frames})
+
+                # Cap to max_frames
+                if len(indices) > max_frames:
+                    indices = indices[:max_frames]
+
+                # Safety: at least one frame
+                if len(indices) == 0:
+                    indices = [0]
             
         else:
             reader.close()

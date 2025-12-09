@@ -40,7 +40,7 @@ WEIGHT_DECAY = 0.01
 GRAD_ACCUM_STEPS = 8        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
 LOG_EVERY = 50              # step di logging
 MAX_VAL_BATCHES = 50        # quante batch usare in val (per velocità)
-MAX_GEN_TOKENS = 64         # max token generati per valutazione
+MAX_GEN_TOKENS = 32         # max token generati per valutazione
 MAX_STEPS = None            # se voglio fermare dopo N step globali, metto un int
 
 RESUME_FROM_LATEST = True       # se True, prova a riprendere dall’ultimo checkpoint
@@ -57,10 +57,10 @@ def build_instruction_prompt() -> str:
     Questo testo è quello che forniamo in input in fase di generazione.
     """
     
-    N_FRAMES_PER_CLIP = 16                  # deve coincidere con n_frames_to_take
+    N_FRAMES_PER_CLIP = 8                  # deve coincidere con n_frames_to_take
     IMAGE_TOKEN_STR = "<|image_pad|>"       # token placeholder immagine
 
-    # Crea "<|image_pad|> <|image_pad|> ... (16 volte)"
+    # Crea "<|image_pad|> <|image_pad|> ... (N volte)"
     image_tokens = " ".join([IMAGE_TOKEN_STR] * N_FRAMES_PER_CLIP)
 
     prompt = (
@@ -391,11 +391,13 @@ def main():
         json_path=str(DATASET_JSON),
         split="train",
         root_dir=str(PROJECT_ROOT),
+        n_frames_to_take=8,
     )
     val_ds = How2SignDataset(               # Costruisco un oggetto Dataset per validation
         json_path=str(DATASET_JSON),
         split="val",
         root_dir=str(PROJECT_ROOT),
+        n_frames_to_take=8,
     )
 
     if is_main_process:

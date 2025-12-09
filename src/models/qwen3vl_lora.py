@@ -49,6 +49,10 @@ def load_qwen3vl_lora(
         attn_implementation="sdpa",
         trust_remote_code=True,
     )
+    
+    model.config.use_cache = False         # no KV cache durante il training
+    model.gradient_checkpointing_enable()  # riduce le attivazioni (meno memoria)
+    
     t3 = time.perf_counter()
     print(f"[TIMER] Base model loaded in {t3 - t2:.2f} seconds.")
 

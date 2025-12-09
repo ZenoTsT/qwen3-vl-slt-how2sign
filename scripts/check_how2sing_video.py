@@ -332,63 +332,64 @@ def main() -> None:
     #     return  # interrompi qui perché il JSON è cambiato
 
     # 2) Statistiche durate per split
-    print("[STATS] Calcolo durata media e video più lungo...")
+    
+    # print("[STATS] Calcolo durata media e video più lungo...")
 
-    stats_train = compute_stats_for_split("train", splits.get("train", []), ROOT_DIR)
-    stats_val = compute_stats_for_split("val", splits.get("val", []), ROOT_DIR)
-    stats_test = compute_stats_for_split("test", splits.get("test", []), ROOT_DIR)
+    # stats_train = compute_stats_for_split("train", splits.get("train", []), ROOT_DIR)
+    # stats_val = compute_stats_for_split("val", splits.get("val", []), ROOT_DIR)
+    # stats_test = compute_stats_for_split("test", splits.get("test", []), ROOT_DIR)
 
-    # 3) Aggregazione globale
-    all_durations: List[float] = (
-        stats_train["durations"]
-        + stats_val["durations"]
-        + stats_test["durations"]
-    )
-    total_videos = len(all_durations)
+    # # 3) Aggregazione globale
+    # all_durations: List[float] = (
+    #     stats_train["durations"]
+    #     + stats_val["durations"]
+    #     + stats_test["durations"]
+    # )
+    # total_videos = len(all_durations)
 
-    if total_videos > 0:
-        global_mean = sum(all_durations) / total_videos
-    else:
-        global_mean = 0.0
+    # if total_videos > 0:
+    #     global_mean = sum(all_durations) / total_videos
+    # else:
+    #     global_mean = 0.0
 
-    # max globale
-    max_candidates = [
-        (stats_train["max_duration"], stats_train["max_info"]),
-        (stats_val["max_duration"], stats_val["max_info"]),
-        (stats_test["max_duration"], stats_test["max_info"]),
-    ]
-    global_max, global_max_info = max(
-        max_candidates, key=lambda x: (x[0] if x[0] is not None else -1)
-    )
+    # # max globale
+    # max_candidates = [
+    #     (stats_train["max_duration"], stats_train["max_info"]),
+    #     (stats_val["max_duration"], stats_val["max_info"]),
+    #     (stats_test["max_duration"], stats_test["max_info"]),
+    # ]
+    # global_max, global_max_info = max(
+    #     max_candidates, key=lambda x: (x[0] if x[0] is not None else -1)
+    # )
 
-    print("\n[STATS] RISULTATI GLOBALI")
-    print(f"  - Video analizzati: {total_videos}")
-    print(f"  - Durata media: {global_mean:.2f}s ({global_mean/60:.2f} min)")
+    # print("\n[STATS] RISULTATI GLOBALI")
+    # print(f"  - Video analizzati: {total_videos}")
+    # print(f"  - Durata media: {global_mean:.2f}s ({global_mean/60:.2f} min)")
 
-    print("  - Video che superano le soglie:")
-    for thr in THRESH_LIST:
-        c = (
-            stats_train["long_counts"][thr]
-            + stats_val["long_counts"][thr]
-            + stats_test["long_counts"][thr]
-        )
-        perc = c / total_videos * 100 if total_videos > 0 else 0.0
-        print(f"      > {thr:>4.1f}s: {c} video ({perc:.2f}%)")
+    # print("  - Video che superano le soglie:")
+    # for thr in THRESH_LIST:
+    #     c = (
+    #         stats_train["long_counts"][thr]
+    #         + stats_val["long_counts"][thr]
+    #         + stats_test["long_counts"][thr]
+    #     )
+    #     perc = c / total_videos * 100 if total_videos > 0 else 0.0
+    #     print(f"      > {thr:>4.1f}s: {c} video ({perc:.2f}%)")
 
-    print(f"  - Video più lungo: {global_max:.2f}s ({global_max/60:.2f} min)")
-    if global_max_info is not None:
-        print("    Dettagli:")
-        print(f"      split: {global_max_info['split']}")
-        print(f"      rel path: {global_max_info['rel_path']}")
-        print(f"      abs path: {global_max_info['abs_path']}")
+    # print(f"  - Video più lungo: {global_max:.2f}s ({global_max/60:.2f} min)")
+    # if global_max_info is not None:
+    #     print("    Dettagli:")
+    #     print(f"      split: {global_max_info['split']}")
+    #     print(f"      rel path: {global_max_info['rel_path']}")
+    #     print(f"      abs path: {global_max_info['abs_path']}")
 
-    # 4) Istogramma testuale + PNG
-    print_text_histogram(all_durations, bins=20)
-    hist_png_path = PROJECT_ROOT / "outputs" / "how2sign_duration_hist.png"
-    # save_histogram_png(all_durations, hist_png_path)
+    # # 4) Istogramma testuale + PNG
+    # print_text_histogram(all_durations, bins=20)
+    # hist_png_path = PROJECT_ROOT / "outputs" / "how2sign_duration_hist.png"
+    # # save_histogram_png(all_durations, hist_png_path)
 
-    # 5) Suggerimenti outlier + fps + max_frames
-    suggest_outlier_threshold_and_frames(all_durations)
+    # # 5) Suggerimenti outlier + fps + max_frames
+    # suggest_outlier_threshold_and_frames(all_durations)
 
 
 if __name__ == "__main__":

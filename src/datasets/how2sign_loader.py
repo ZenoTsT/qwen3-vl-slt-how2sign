@@ -27,7 +27,7 @@ class How2SignDataset(Dataset):
         json_path: str = "data/How2Sign/how2sign_dataset.json",
         split: str = "train",                      # "train" | "val" | "test"
         n_frames_to_take: Optional[int] = 32,      # None = tutti i frame
-        frame_sampling_strategy: str = "fps2_max32",  # "uniform" | "consecutive" | "center" | "random" | "fps2_max32"
+        frame_sampling_strategy: str = "uniform",  # "uniform" | "consecutive" | "center" | "random" | "fps2_max32"
         root_dir: Optional[str] = None,
     ) -> None:
         super().__init__()                          # chiamo il costruttore della classe Dataset (per __getitem__ ecc ecc)

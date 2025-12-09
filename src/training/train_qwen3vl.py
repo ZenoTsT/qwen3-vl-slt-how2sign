@@ -391,13 +391,13 @@ def main():
         json_path=str(DATASET_JSON),
         split="train",
         root_dir=str(PROJECT_ROOT),
-        n_frames_to_take=32,
+        n_frames_to_take=8,
     )
     val_ds = How2SignDataset(               # Costruisco un oggetto Dataset per validation
         json_path=str(DATASET_JSON),
         split="val",
         root_dir=str(PROJECT_ROOT),
-        n_frames_to_take=32,
+        n_frames_to_take=8,
     )
 
     if is_main_process:

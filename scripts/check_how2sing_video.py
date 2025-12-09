@@ -305,12 +305,22 @@ def main() -> None:
     missing = check_missing_videos(splits, ROOT_DIR)
 
     print("\n[REPORT] Video mancanti:")
+    outputs_dir = PROJECT_ROOT / "outputs"
+    outputs_dir.mkdir(exist_ok=True, parents=True)
+
     total_missing = 0
     for split_name in ["train", "val", "test"]:
         split_missing = missing.get(split_name, [])
+
         print(f"  - {split_name}: {len(split_missing)}")
         total_missing += len(split_missing)
-    print(f"  >>> Totale mancanti: {total_missing}\n")
+
+        # Salva la lista dei file mancanti
+        out_file = outputs_dir / f"missing_{split_name}.txt"
+        out_file.write_text("\n".join(split_missing), encoding="utf-8")
+
+    print(f"  >>> Totale mancanti: {total_missing}")
+    print(f"[INFO] Liste file mancanti salvate in: {outputs_dir}\n")
     
     # --------------------------------------------------------
     # OPTIONAL: pulizia automatica del JSON

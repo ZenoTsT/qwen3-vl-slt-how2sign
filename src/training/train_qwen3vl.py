@@ -57,19 +57,31 @@ def build_instruction_prompt() -> str:
     Questo testo è quello che forniamo in input in fase di generazione.
     """
     
-    N_FRAMES_PER_CLIP = 8                  # deve coincidere con n_frames_to_take
-    IMAGE_TOKEN_STR = "<|image_pad|>"       # token placeholder immagine
-
-    # Crea "<|image_pad|> <|image_pad|> ... (N volte)"
-    image_tokens = " ".join([IMAGE_TOKEN_STR] * N_FRAMES_PER_CLIP)
-
     prompt = (
-        f"You are a sign language translation model. "
-        f"Given the following sign language video frames {image_tokens}, "
-        f"translate it into English.\n\n"
-        f"Answer with the English sentence only.\n\n"
-        f"Translation:"
+        "You are a sign language translation model. "
+        "Given the following sign language video, "
+        "translate it into English.\n\n"
+        "Answer with the English sentence only.\n\n"
+        "Translation:"
     )
+    
+    #
+    # DECOMMENTO PER IMMAGINI
+    #
+    
+    # N_FRAMES_PER_CLIP = 8                  # deve coincidere con n_frames_to_take
+    # IMAGE_TOKEN_STR = "<|image_pad|>"       # token placeholder immagine
+
+    # # Crea "<|image_pad|> <|image_pad|> ... (N volte)"
+    # image_tokens = " ".join([IMAGE_TOKEN_STR] * N_FRAMES_PER_CLIP)
+
+    # prompt = (
+    #     f"You are a sign language translation model. "
+    #     f"Given the following sign language video frames {image_tokens}, "
+    #     f"translate it into English.\n\n"
+    #     f"Answer with the English sentence only.\n\n"
+    #     f"Translation:"
+    # )
     return prompt
 
 
@@ -300,19 +312,31 @@ def evaluate(model, processor, device: str, val_loader, max_batches: int, is_mai
         if b_idx >= max_batches:
             break
 
-        images_batch = batch["images"]     # List[List[PIL.Image]] 
+        #images_batch = batch["images"]     # List[List[PIL.Image]] 
+        videos_batch = batch["videos"]     # List[str] (path ai video) in modalità "video"
         texts_batch = batch["texts"]       # List[str] (ground truth)
 
         # ====== 1) Loss in teacher forcing ======
         train_texts = [build_training_text(t) for t in texts_batch]
         # Processor converte immagini + testo in tensori. input è un dict di tensori input = {"input_ids": token del testo, "pixel_values": tensori dei frame}
+        # inputs = processor( 
+        #     images=images_batch,
+        #     text=train_texts,
+        #     return_tensors="pt",
+        #     padding=True,
+        #     truncation=True,
+        # )
+        
         inputs = processor( 
-            images=images_batch,
-            text=train_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
+        videos=videos_batch,
+        text=train_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        num_frames=16,    # Campi opzionali
+        # fps=2.0,          # Campi opzionali
         )
+        
         inputs = {k: v.to(device) for k, v in inputs.items()} # sposto tutti i tensori sulla GPU corretta
         labels = inputs["input_ids"].clone() # clono il tensore dei testi da predirre (in modo da tenerle come label)
         labels = mask_prompt_tokens(labels, inputs["input_ids"], processor)
@@ -387,17 +411,32 @@ def main():
     # -----------------------
     # 2) Dataset + Dataloader
     # -----------------------
+    
+    # IMMAGINI
+    # train_ds = How2SignDataset(             # Costruisco un oggetto Dataset per training
+    #     json_path=str(DATASET_JSON),
+    #     split="train",
+    #     root_dir=str(PROJECT_ROOT),
+    #     n_frames_to_take=8,
+    # )
+    # val_ds = How2SignDataset(               # Costruisco un oggetto Dataset per validation
+    #     json_path=str(DATASET_JSON),
+    #     split="val",
+    #     root_dir=str(PROJECT_ROOT),
+    #     n_frames_to_take=8,
+    # )
+    
     train_ds = How2SignDataset(             # Costruisco un oggetto Dataset per training
-        json_path=str(DATASET_JSON),
-        split="train",
-        root_dir=str(PROJECT_ROOT),
-        n_frames_to_take=8,
+    json_path=str(DATASET_JSON),
+    split="train",
+    root_dir=str(PROJECT_ROOT),
+    return_type="video",    
     )
-    val_ds = How2SignDataset(               # Costruisco un oggetto Dataset per validation
+    val_ds = How2SignDataset(             
         json_path=str(DATASET_JSON),
         split="val",
         root_dir=str(PROJECT_ROOT),
-        n_frames_to_take=8,
+        return_type="video",
     )
 
     if is_main_process:
@@ -517,7 +556,8 @@ def main():
         for step_in_epoch, batch in enumerate(data_iter, start=1):
             global_step += 1
 
-            images_batch = batch["images"]  # List[List[PIL.Image]]
+            # images_batch = batch["images"]  # List[List[PIL.Image]]
+            videos_batch = batch["videos"]  # List[str] (path ai video)
             texts_batch = batch["texts"]    # List[str]
 
             # Testo di training = istruzione + frase target
@@ -525,11 +565,14 @@ def main():
 
             # Processor converte immagini + testo in tensori. input è un dict di tensori input = {"input_ids": token del testo, "pixel_values": tensori dei frame}
             inputs = processor(
-                images=images_batch,
+                # images=images_batch,
+                videos=videos_batch,
                 text=full_texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
+                num_frames=16,    # campi opzionali
+                # fps=2.0,          # campi opzionali
             )
             inputs = {k: v.to(device) for k, v in inputs.items()} # sposto tutti i tensori sulla GPU corretta
             labels = inputs["input_ids"].clone() # clono il tensore dei testi da predirre (in modo da tenerle come label)

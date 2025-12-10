@@ -29,8 +29,16 @@ class How2SignDataset(Dataset):
         n_frames_to_take: Optional[int] = 32,      # None = tutti i frame
         frame_sampling_strategy: str = "uniform",  # "uniform" | "consecutive" | "center" | "random" | "fps2_max32"
         root_dir: Optional[str] = None,
+        return_type: str = "video",               # "images" | "video"
     ) -> None:
         super().__init__()                          # chiamo il costruttore della classe Dataset (per __getitem__ ecc ecc)
+
+        # modalità di ritorno del dataset: "images" (frame estratti) o "video" (solo path al file video)
+        self.return_type = return_type
+        if self.return_type not in ("images", "video"):
+            raise ValueError(
+                f"return_type deve essere 'images' oppure 'video', trovato: {self.return_type}"
+            )
 
         self.json_path = Path(json_path).resolve()
         if not self.json_path.exists():
@@ -62,7 +70,8 @@ class How2SignDataset(Dataset):
 
         print(
             f"[How2SignDataset] split={self.split} | num_samples={len(self.entries)} | "
-            f"n_frames_to_take={self.n_frames_to_take} | strategy={self.frame_sampling_strategy}"
+            f"n_frames_to_take={self.n_frames_to_take} | strategy={self.frame_sampling_strategy} | "
+            f"return_type={self.return_type}"
         )
         print(f"[How2SignDataset] json_path={self.json_path}")
         print(f"[How2SignDataset] root_dir={self.root_dir}")
@@ -80,29 +89,46 @@ class How2SignDataset(Dataset):
         if not video_abs.exists():
             raise FileNotFoundError(f"Video non trovato: {video_abs}")
 
-        # Estrae i frame on-the-fly
-        frames = extract_frames_from_video(
-            video_path=str(video_abs),
-            n_frames_to_take=self.n_frames_to_take,
-            strategy=self.frame_sampling_strategy,
-        )
-
         # Testo target (ground truth)
         sentence: str = entry["sentence"]
 
-        sample: Dict[str, Any] = {
-            "images": frames,                 # List[PIL.Image]
-            "target_text": sentence,          # stringa inglese ground truth
-            "split": entry["split"],
-            "video_path": str(video_abs),
-            "video_rel_path": entry["video_path"],
-            "video_id": entry["video_id"],
-            "video_name": entry["video_name"],
-            "sentence_id": entry["sentence_id"],
-            "sentence_name": entry["sentence_name"],
-            "start_realigned": entry["start_realigned"],
-            "end_realigned": entry["end_realigned"],
-        }
+        if self.return_type == "images":
+            # Estrae i frame on-the-fly
+            frames = extract_frames_from_video(
+                video_path=str(video_abs),
+                n_frames_to_take=self.n_frames_to_take,
+                strategy=self.frame_sampling_strategy,
+            )
+
+            sample: Dict[str, Any] = {
+                "images": frames,                 # List[PIL.Image]
+                "target_text": sentence,          # stringa inglese ground truth
+                "split": entry["split"],
+                "video_path": str(video_abs),
+                "video_rel_path": entry["video_path"],
+                "video_id": entry["video_id"],
+                "video_name": entry["video_name"],
+                "sentence_id": entry["sentence_id"],
+                "sentence_name": entry["sentence_name"],
+                "start_realigned": entry["start_realigned"],
+                "end_realigned": entry["end_realigned"],
+            }
+        else:
+            # modalità "video": non estraiamo frame, lasciamo che sia il processor (es. Qwen3VLVideoProcessor)
+            # a gestire il video a partire dal path.
+            sample: Dict[str, Any] = {
+                # nessun campo "images" qui: il collate_fn gestirà questa modalità restituendo "videos"
+                "target_text": sentence,          # stringa inglese ground truth
+                "split": entry["split"],
+                "video_path": str(video_abs),
+                "video_rel_path": entry["video_path"],
+                "video_id": entry["video_id"],
+                "video_name": entry["video_name"],
+                "sentence_id": entry["sentence_id"],
+                "sentence_name": entry["sentence_name"],
+                "start_realigned": entry["start_realigned"],
+                "end_realigned": entry["end_realigned"],
+            }
 
         return sample
 
@@ -118,10 +144,32 @@ def how2sign_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]: # batch 
     script di training, dove avremo accesso all'oggetto `processor`.
     """
 
-    images_batch = [sample["images"] for sample in batch]          # List[List[PIL.Image]]
-    texts_batch = [sample["target_text"] for sample in batch]      # List[str]
+    # Se i sample hanno il campo "images", siamo in modalità frame/immagini (comportamento originale).
+    if "images" in batch[0]:
+        images_batch = [sample["images"] for sample in batch]          # List[List[PIL.Image]]
+        texts_batch = [sample["target_text"] for sample in batch]      # List[str]
 
-    # meta = tutto tranne immagini e testo
+        # meta = tutto tranne immagini e testo
+        meta_batch: List[Dict[str, Any]] = []
+        for sample in batch:
+            meta = {
+                k: v
+                for k, v in sample.items()
+                if k not in ("images", "target_text")
+            }
+            meta_batch.append(meta)
+
+        return {
+            "images": images_batch, 
+            "texts": texts_batch,
+            "meta": meta_batch,
+        }
+
+    # Altrimenti assumiamo modalità "video": nessun campo "images", ma abbiamo "video_path" + "target_text".
+    videos_batch = [sample["video_path"] for sample in batch]         # List[str] (path assoluti dei video)
+    texts_batch = [sample["target_text"] for sample in batch]         # List[str]
+
+    # meta = tutto tranne immagini e testo (qui non ci sono immagini, ma manteniamo la stessa logica)
     meta_batch: List[Dict[str, Any]] = []
     for sample in batch:
         meta = {
@@ -132,7 +180,7 @@ def how2sign_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]: # batch 
         meta_batch.append(meta)
 
     return {
-        "images": images_batch, 
+        "videos": videos_batch, 
         "texts": texts_batch,
         "meta": meta_batch,
     }

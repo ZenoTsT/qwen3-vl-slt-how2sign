@@ -11,6 +11,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch import amp
 from tqdm import tqdm
+import time
 
 # ---------------------------------------------------------------------
 # PYTHONPATH: aggiungo la root del progetto
@@ -59,7 +60,7 @@ def build_instruction_prompt() -> str:
     
     prompt = (
         "You are a sign language translation model. "
-        "Given the following sign language video, "
+        "Given the following sign language video <|video_pad|>, "
         "translate it into English.\n\n"
         "Answer with the English sentence only.\n\n"
         "Translation:"
@@ -333,7 +334,7 @@ def evaluate(model, processor, device: str, val_loader, max_batches: int, is_mai
         return_tensors="pt",
         padding=True,
         truncation=True,
-        num_frames=16,    # Campi opzionali
+        # num_frames=16,    # Campi opzionali
         # fps=2.0,          # Campi opzionali
         )
         
@@ -531,6 +532,7 @@ def main():
     # -----------------------
     # 5) Training loop
     # -----------------------
+    
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         if world_size > 1:
             # importantissimo per DDP: shuffle diverso per epoca
@@ -552,9 +554,20 @@ def main():
 
         # azzeriamo i grad all'inizio
         optimizer.zero_grad()
+        
+        # >>> DEBUG: per misurare tempo data loading / step
+        torch.cuda.synchronize()
+        t_prev = time.perf_counter()
+        # <<< DEBUG
 
         for step_in_epoch, batch in enumerate(data_iter, start=1):
             global_step += 1
+            
+            # >>> DEBUG: tempo data loading
+            torch.cuda.synchronize()
+            t_batch_start = time.perf_counter()
+            data_loading_time = t_batch_start - t_prev
+            # <<< DEBUG
 
             # images_batch = batch["images"]  # List[List[PIL.Image]]
             videos_batch = batch["videos"]  # List[str] (path ai video)
@@ -562,6 +575,10 @@ def main():
 
             # Testo di training = istruzione + frase target
             full_texts = [build_training_text(t) for t in texts_batch]
+            
+            # >>> DEBUG: tempo processor (decoding + preprocess)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
             # Processor converte immagini + testo in tensori. input è un dict di tensori input = {"input_ids": token del testo, "pixel_values": tensori dei frame}
             inputs = processor(
@@ -571,9 +588,28 @@ def main():
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                num_frames=16,    # campi opzionali
+                # num_frames=16,    # campi opzionali
                 # fps=2.0,          # campi opzionali
             )
+            
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            prep_time = t1 - t0
+            # <<< DEBUG
+            
+            # >>> DEBUG: shape tensori al primo step
+            if is_main_process and global_step == 1:
+                print("[DEBUG] processor output keys:", inputs.keys())
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        print(f"[DEBUG] inputs[{k}].shape = {tuple(v.shape)}")
+                if "pixel_values_videos" in inputs:
+                    print(
+                        "[DEBUG] pixel_values_videos shape:",
+                        tuple(inputs["pixel_values_videos"].shape),
+                    )
+            # <<< DEBUG
+            
             inputs = {k: v.to(device) for k, v in inputs.items()} # sposto tutti i tensori sulla GPU corretta
             labels = inputs["input_ids"].clone() # clono il tensore dei testi da predirre (in modo da tenerle come label)
             labels = mask_prompt_tokens(labels, inputs["input_ids"], processor)
@@ -595,6 +631,12 @@ def main():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+                
+            # >>> DEBUG: tempo forward+backward
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            fwd_bwd_time = t2 - t1
+            # <<< DEBUG
 
             running_loss += loss.item() * GRAD_ACCUM_STEPS  # torniamo alla loss "vera"
             
@@ -613,14 +655,27 @@ def main():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # evita esplosioni di gradiente
                     optimizer.step()
                 optimizer.zero_grad()
+                
 
-            # Logging solo su main process
+             # >>> DEBUG: log tempi ogni LOG_EVERY step
             if is_main_process and (global_step % LOG_EVERY == 0):
                 avg_loss = running_loss / LOG_EVERY
                 running_loss = 0.0
                 if isinstance(data_iter, tqdm):
                     data_iter.set_postfix({"loss": f"{avg_loss:.4f}"})
-                print(f"[STEP {global_step}] train_loss = {avg_loss:.4f}")
+                print(
+                    f"[STEP {global_step}] "
+                    f"loss={avg_loss:.4f} | "
+                    f"data={data_loading_time:.2f}s | "
+                    f"prep={prep_time:.2f}s | "
+                    f"fwd+bwd={fwd_bwd_time:.2f}s"
+                )
+            # <<< DEBUG
+
+            # >>> DEBUG: tempo fine step per misura data loading prossimo step
+            torch.cuda.synchronize()
+            t_prev = time.perf_counter()
+            # <<< DEBUG
 
             if MAX_STEPS is not None and global_step >= MAX_STEPS:
                 if is_main_process:

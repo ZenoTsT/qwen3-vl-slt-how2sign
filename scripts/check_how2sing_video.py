@@ -28,7 +28,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent          # .../scripts
 PROJECT_ROOT = SCRIPT_DIR.parent                      # root del repo
-JSON_PATH = PROJECT_ROOT / "data/How2Sign/how2sign_dataset.json"
+JSON_PATH = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 ROOT_DIR = PROJECT_ROOT
 
 # Soglie per contare i "video lunghi" (in secondi)

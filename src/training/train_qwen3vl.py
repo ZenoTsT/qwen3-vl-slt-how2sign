@@ -31,7 +31,7 @@ from src.models.qwen3vl_lora import load_qwen3vl_lora
 # Config di base
 # ---------------------------------------------------------------------
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
-DATASET_JSON = PROJECT_ROOT / "data/How2Sign/how2sign_dataset.json"
+DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
 BATCH_SIZE = 1              # poi si prova ad alzare

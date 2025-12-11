@@ -10,7 +10,7 @@ from typing import Dict, List, Any
 # ----------------------------------------------------------
 THIS_DIR = Path(__file__).resolve().parent
 ROOT_DIR = THIS_DIR.parent  # qwen3-vl-slt-how2sign/
-DATA_DIR = ROOT_DIR / "data" / "How2Sign"
+DATA_DIR = ROOT_DIR / "data" / "How2Sign_resized"
 
 OUTPUT_JSON = DATA_DIR / "how2sign_dataset.json"
 

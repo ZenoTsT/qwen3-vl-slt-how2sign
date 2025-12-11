@@ -63,3 +63,9 @@ data/How2Sign/
 *.tar
 *.tar.gz
 *.zip
+
+# How2Sign_resized dataset 
+data/How2Sign_resized/
+*.tar
+*.tar.gz
+*.zip

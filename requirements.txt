@@ -8,3 +8,5 @@ pyyaml
 imageio
 imageio-ffmpeg
 tqdm
+av
+ffmpeg

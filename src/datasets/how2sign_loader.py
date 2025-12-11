@@ -24,7 +24,7 @@ class How2SignDataset(Dataset):
 
     def __init__(
         self,
-        json_path: str = "data/How2Sign/how2sign_dataset.json",
+        json_path: str = "data/How2Sign_resized/how2sign_dataset.json",
         split: str = "train",                      # "train" | "val" | "test"
         n_frames_to_take: Optional[int] = 32,      # None = tutti i frame
         frame_sampling_strategy: str = "uniform",  # "uniform" | "consecutive" | "center" | "random" | "fps2_max32"

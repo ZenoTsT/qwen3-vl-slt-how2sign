@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+import shutil
 import sys
 import json
 from contextlib import nullcontext
@@ -31,6 +32,8 @@ from src.models.qwen3vl_lora import load_qwen3vl_lora
 # Config di base
 # ---------------------------------------------------------------------
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
+STAGE = "stage1"  # "stage1" | "stage2"
+
 DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
@@ -47,6 +50,8 @@ MAX_STEPS = None            # se voglio fermare dopo N step globali, metto un in
 RESUME_FROM_LATEST = True       # se True, prova a riprendere dall’ultimo checkpoint
 EARLY_STOPPING_PATIENCE = 3     # numero di epoche senza miglioramento prima di fermarsi
 EARLY_STOPPING_MIN_DELTA = 0.0  # quanto deve migliorare almeno la val_loss per essere considerato "miglioramento"
+
+INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps
 
 
 # ---------------------------------------------------------------------
@@ -207,62 +212,221 @@ def cleanup_ddp():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
+
 # ---------------------------------------------------------------------
 # Checkpoint utils & logging
 # ---------------------------------------------------------------------
-def find_latest_checkpoint(output_dir: Path) -> Path | None:
+def _get_stage_ckpt_dir(
+    output_dir: Path,
+    stage: str,
+    kind: str,  # "intra_latest" | "epoch_latest" | "epoch_best"
+) -> Path:
     """
-    Restituisce il path dell'ultimo checkpoint in OUTPUT_DIR/checkpoints,
-    oppure None se non ne trova.
+    Directory radice per i checkpoint di uno stage e di un certo tipo.
+    Esempio:
+        outputs/.../checkpoints/stage1/epoch_best/
     """
-    ckpt_dir = output_dir / "checkpoints"
-    if not ckpt_dir.exists():
-        return None
+    return output_dir / "checkpoints" / stage / kind
 
-    ckpts = sorted(ckpt_dir.glob("epoch_*_step_*.pt"))
-    if not ckpts:
-        return None
 
-    return ckpts[-1]  # l'ultimo in ordine alfabetico (grazie a zeri padding)
-
-def save_checkpoint(
+def save_lora_checkpoint(
     model,
     optimizer,
     scaler,
     epoch: int,
+    step_in_epoch: int | None,
     global_step: int,
     best_val_loss: float,
     epochs_no_improve: int,
     output_dir: Path,
+    stage: str,
+    kind: str,              # "intra_latest" | "epoch_latest" | "epoch_best"
     is_main_process: bool,
 ):
     """
-    Salva un checkpoint completo (model+optimizer+scaler+metadati).
-    Salva solo dal processo principale (rank 0).
+    Salva un checkpoint *solo LoRA* + stato di training, in formato uniforme,
+    per:
+        - intra_latest  (ripartenza dentro epoca)
+        - epoch_latest  (ripartenza pulita tra epoche)
+        - epoch_best    (miglior modello)
+
     """
     if not is_main_process:
         return
 
-    ckpt_dir = output_dir / "checkpoints"
+    ckpt_dir = _get_stage_ckpt_dir(output_dir, stage, kind)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_path = ckpt_dir / f"epoch_{epoch:02d}_step_{global_step:06d}.pt"
-    print(f"[INFO] Saving checkpoint to {ckpt_path}")
+    adapter_path = ckpt_dir / "adapter.pt"
+    state_path = ckpt_dir / "state.pt"
 
-    # Se il modello è DDP, vogliamo i pesi del 'module' interno (model è un oggetto DDP dove model.module è il vero modello)
+    # Se il modello è wrappato in DDP, prendo il .module interno (PeftModel)
     model_to_save = model.module if hasattr(model, "module") else model
 
+    # 1) Salvo SOLO i pesi LoRA (filtrando i parametri che contengono "lora_")
+    lora_state = {
+        name: p.detach().cpu()
+        for name, p in model_to_save.state_dict().items()
+        if "lora_" in name
+    }
+
+    torch.save(lora_state, adapter_path)
+
+    # 2) Stato di training (uguale per intra_latest / epoch_latest / epoch_best)
     state = {
+        "stage": stage,
         "epoch": epoch,
+        "step_in_epoch": step_in_epoch,  # None per epoch_*
         "global_step": global_step,
         "best_val_loss": best_val_loss,
         "epochs_no_improve": epochs_no_improve,
-        "model": model_to_save.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
     }
-    torch.save(state, ckpt_path)
+    torch.save(state, state_path)
 
+    print(f"[CKPT] Saved {kind} checkpoint for {stage} at {ckpt_dir}")
+
+def load_lora_checkpoint(
+    model,
+    optimizer,
+    scaler,
+    output_dir: Path,
+    stage: str,
+    device: str,
+    is_main_process: bool,
+):
+    """
+    Carica un checkpoint LoRA seguendo questa priorità:
+
+        1) checkpoints/{stage}/intra_latest/{adapter.pt,state.pt}
+        2) checkpoints/{stage}/epoch_latest/{adapter.pt,state.pt}
+
+    Se non trova nulla, torna il modello com'è e uno stato di training "fresh".
+
+    Cosa viene caricato:
+        - adapter.pt: SOLO i pesi LoRA (parametri con 'lora_' nel nome)
+                      che vengono fusi nello state_dict del modello
+        - state.pt:   stato di training, con chiavi come:
+                        - epoch
+                        - step_in_epoch
+                        - global_step
+                        - best_val_loss
+                        - epochs_no_improve
+                        - optimizer (state_dict)
+                        - scaler    (state_dict opzionale)
+                        - stage     (opzionale, per sicurezza)
+    """
+    ckpt_root = output_dir / "checkpoints" / stage
+
+    # Ordine di priorità: prima intra_latest (crash dentro epoca),
+    # poi epoch_latest (ripartenza pulita tra epoche).
+    candidates = ["intra_latest", "epoch_latest"]
+
+    chosen_kind = None
+    adapter_path = None
+    state_path = None
+
+    for kind in candidates:
+        kind_dir = ckpt_root / kind
+        a_path = kind_dir / "adapter.pt"
+        s_path = kind_dir / "state.pt"
+
+        if a_path.exists() and s_path.exists():
+            chosen_kind = kind
+            adapter_path = a_path
+            state_path = s_path
+            break
+
+    # Nessun checkpoint trovato: ritorno stato iniziale
+    if chosen_kind is None:
+        if is_main_process:
+            print("[INFO] No LoRA checkpoints found (intra_latest / epoch_latest). Starting from scratch.")
+
+        training_state = {
+            "epoch": 1,
+            "step_in_epoch": 0,           # verrà interpretato dal training loop
+            "global_step": 0,
+            "best_val_loss": float("inf"),
+            "epochs_no_improve": 0,
+            "kind": None,
+        }
+        return model, optimizer, scaler, training_state
+
+    # ------------------------------------------------------------
+    # 1) Log di debug
+    # ------------------------------------------------------------
+    if is_main_process:
+        print(f"[INFO] Loading LoRA checkpoint kind='{chosen_kind}' from: {state_path.parent}")
+
+    # ------------------------------------------------------------
+    # 2) Carico SOLO i pesi LoRA (adapter.pt)
+    # ------------------------------------------------------------
+    # adapter_state contiene solo i parametri LoRA (quelli che salveremo noi),
+    # quindi li fondiamo nello state_dict attuale del modello.
+    adapter_state = torch.load(adapter_path, map_location="cpu")
+
+    # Se DDP, lavoriamo su model.module, come nel save
+    model_to_load = model.module if hasattr(model, "module") else model
+    model_state = model_to_load.state_dict()
+
+    for k, v in adapter_state.items():
+        if k in model_state:
+            model_state[k] = v.to(device)
+        else:
+            if is_main_process:
+                print(f"[WARN] LoRA key '{k}' not found in model.state_dict() — skipping.")
+
+    # carica sul "vero" modello, non sul wrapper DDP
+    model_to_load.load_state_dict(model_state)
+
+    # ------------------------------------------------------------
+    # 3) Carico lo stato di training (state.pt)
+    # ------------------------------------------------------------
+    train_state = torch.load(state_path, map_location="cpu")
+
+    # Ottimizzatore
+    if optimizer is not None and "optimizer" in train_state and train_state["optimizer"] is not None:
+        optimizer.load_state_dict(train_state["optimizer"])
+
+    # GradScaler
+    if scaler is not None and train_state.get("scaler") is not None:
+        scaler.load_state_dict(train_state["scaler"])
+
+    # Meta-dati di training
+    epoch = train_state.get("epoch", 1)
+    step_in_epoch = train_state.get("step_in_epoch", 0)
+    global_step = train_state.get("global_step", 0)
+    best_val_loss = train_state.get("best_val_loss", float("inf"))
+    epochs_no_improve = train_state.get("epochs_no_improve", 0)
+
+    # (opzionale) check stage
+    ckpt_stage = train_state.get("stage", None)
+    if ckpt_stage is not None and ckpt_stage != stage and is_main_process:
+        print(
+            f"[WARN] Checkpoint stage='{ckpt_stage}' "
+            f"does not match current STAGE='{stage}'. "
+            "Are you sure this is the right checkpoint?"
+        )
+
+    training_state = {
+        "epoch": epoch,
+        "step_in_epoch": step_in_epoch,
+        "global_step": global_step,
+        "best_val_loss": best_val_loss,
+        "epochs_no_improve": epochs_no_improve,
+        "kind": chosen_kind,  # 'intra_latest' o 'epoch_latest'
+    }
+
+    if is_main_process:
+        print(
+            f"[INFO] Loaded training state: "
+            f"epoch={epoch}, step_in_epoch={step_in_epoch}, "
+            f"global_step={global_step}, best_val_loss={best_val_loss:.4f}, "
+            f"epochs_no_improve={epochs_no_improve}, kind={chosen_kind}"
+        )
+
+    return model, optimizer, scaler, training_state
 
 def log_epoch_metrics(epoch: int, global_step: int, metrics: Dict[str, float], output_dir: Path, is_main_process: bool):
     """
@@ -287,7 +451,6 @@ def log_epoch_metrics(epoch: int, global_step: int, metrics: Dict[str, float], o
         f.write(json.dumps(payload) + "\n")
 
     print(f"[LOG] Epoch {epoch} metrics: {payload}")
-
 
 # ---------------------------------------------------------------------
 # Evaluation
@@ -386,13 +549,21 @@ def main():
     # -----------------------
     # 1) Modello + processor
     # -----------------------
-    model, processor = load_qwen3vl_lora(
-        model_name=MODEL_NAME,
-        r=16,
-        alpha=32,
-        dropout=0.05,
-        device=device,
-    )
+    if STAGE == "stage1":
+        model, processor = load_qwen3vl_lora(
+            model_name=MODEL_NAME,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
+            stage="stage1",
+        )
+    else:
+        model, processor = load_qwen3vl_lora(
+            model_name=MODEL_NAME,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
+            stage="stage2",
+            stage1_adapter_dir=str(OUTPUT_DIR / "checkpoints" / "stage1" / "epoch_best"),
+        )
 
     # In multi-GPU, wrappiamo in DDP (1 processo per GPU)
     if world_size > 1:
@@ -486,41 +657,52 @@ def main():
     # -----------------------
     # 4) Stato training (resume / early stopping)
     # -----------------------
-    global_step = 0                     # conto quanti update l’optimizer ha già fatto (1 per ogni batch)
-    best_val_loss = float("inf")        # starto la loss iniziale ad infinito
-    epochs_no_improve = 0               # contatore per early stopping
-
-    start_epoch = 1
+    # default: training "fresh"
+    training_state = {
+        "epoch": 1,
+        "step_in_epoch": 0,
+        "global_step": 0,
+        "best_val_loss": float("inf"),
+        "epochs_no_improve": 0,
+        "kind": None,
+    }
 
     if RESUME_FROM_LATEST:
-        ckpt_path = find_latest_checkpoint(OUTPUT_DIR)
-        if ckpt_path is not None:
-            if is_main_process:
-                print(f"[INFO] Resuming from checkpoint: {ckpt_path}")
-            # tutti i rank caricano lo stesso checkpoint
-            map_location = device if device == "cpu" else device
-            ckpt = torch.load(ckpt_path, map_location=map_location)
+        # carica (se esiste) intra_latest o epoch_latest
+        model, optimizer, scaler, training_state = load_lora_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            output_dir=OUTPUT_DIR,
+            stage=STAGE,
+            device=device,
+            is_main_process=is_main_process,
+        )
 
-            # i pesi del modello funzionano sia con DDP che senza
-            model.load_state_dict(ckpt["model"])
-            optimizer.load_state_dict(ckpt["optimizer"])
-            if scaler is not None and ckpt.get("scaler") is not None:
-                scaler.load_state_dict(ckpt["scaler"])
+    # estraggo lo stato
+    ckpt_kind = training_state["kind"]           # None | "intra_latest" | "epoch_latest"
+    ckpt_epoch = training_state["epoch"]
+    step_resume = training_state["step_in_epoch"]
+    global_step = training_state["global_step"]
+    best_val_loss = training_state["best_val_loss"]
+    epochs_no_improve = training_state["epochs_no_improve"]
 
-            start_epoch = ckpt.get("epoch", 0) + 1
-            global_step = ckpt.get("global_step", 0)
-            best_val_loss = ckpt.get("best_val_loss", float("inf"))
-            epochs_no_improve = ckpt.get("epochs_no_improve", 0)
+    # log riassuntivo
+    if is_main_process:
+        print(
+            f"[INFO] Initial training state -> "
+            f"epoch={ckpt_epoch}, step_in_epoch={step_resume}, "
+            f"global_step={global_step}, best_val_loss={best_val_loss:.4f}, "
+            f"epochs_no_improve={epochs_no_improve}, kind={ckpt_kind}"
+        )
 
-            if is_main_process:
-                print(
-                    f"[INFO] Resume state -> start_epoch={start_epoch}, "
-                    f"global_step={global_step}, best_val_loss={best_val_loss:.4f}, "
-                    f"epochs_no_improve={epochs_no_improve}"
-                )
-        else:
-            if is_main_process:
-                print("[INFO] No checkpoint found, starting from scratch.")
+    # se ho un epoch_latest, riparto dall'epoca successiva
+    if ckpt_kind == "epoch_latest":
+        start_epoch = ckpt_epoch + 1
+        step_resume = 0  # ricomincio da inizio epoca
+    else:
+        # fresh oppure intra_latest: riparto dalla stessa epoca
+        start_epoch = ckpt_epoch
 
     # Se il checkpoint era già oltre NUM_EPOCHS, non ha senso ripartire
     if start_epoch > NUM_EPOCHS:
@@ -556,15 +738,36 @@ def main():
         optimizer.zero_grad()
         
         # >>> DEBUG: per misurare tempo data loading / step
-        torch.cuda.synchronize()
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
         t_prev = time.perf_counter()
         # <<< DEBUG
+        
+        # Flag: sto riprendendo da un intra_latest in QUESTA epoca?
+        resuming_in_this_epoch = (
+            ckpt_kind == "intra_latest"
+            and epoch == ckpt_epoch
+            and step_resume > 0
+        )
 
         for step_in_epoch, batch in enumerate(data_iter, start=1):
+            # --------- SKIP BATCHES GIÀ FATTI (intra_latest) ----------
+            if resuming_in_this_epoch and step_in_epoch <= step_resume:
+                if is_main_process and step_in_epoch == 1:
+                    print(
+                        f"[INFO] Resuming from intra_latest: "
+                        f"skipping first {step_resume} steps of epoch {epoch}."
+                    )
+                if device.startswith("cuda"):
+                    torch.cuda.synchronize()
+                t_prev = time.perf_counter()
+                continue
+            
             global_step += 1
             
             # >>> DEBUG: tempo data loading
-            torch.cuda.synchronize()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
             t_batch_start = time.perf_counter()
             data_loading_time = t_batch_start - t_prev
             # <<< DEBUG
@@ -577,7 +780,8 @@ def main():
             full_texts = [build_training_text(t) for t in texts_batch]
             
             # >>> DEBUG: tempo processor (decoding + preprocess)
-            torch.cuda.synchronize()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
 
             # Processor converte immagini + testo in tensori. input è un dict di tensori input = {"input_ids": token del testo, "pixel_values": tensori dei frame}
@@ -592,7 +796,8 @@ def main():
                 # fps=2.0,          # campi opzionali
             )
             
-            torch.cuda.synchronize()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
             t1 = time.perf_counter()
             prep_time = t1 - t0
             # <<< DEBUG
@@ -633,7 +838,8 @@ def main():
                 loss.backward()
                 
             # >>> DEBUG: tempo forward+backward
-            torch.cuda.synchronize()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
             t2 = time.perf_counter()
             fwd_bwd_time = t2 - t1
             # <<< DEBUG
@@ -656,8 +862,25 @@ def main():
                     optimizer.step()
                 optimizer.zero_grad()
                 
+                if global_step % INTRA_SAVE_EVERY_STEPS == 0:
+                    # --------- SALVA intra_latest DOPO UNO STEP PULITO ----------
+                    save_lora_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        epoch=epoch,
+                        step_in_epoch=step_in_epoch,
+                        global_step=global_step,
+                        best_val_loss=best_val_loss,
+                        epochs_no_improve=epochs_no_improve,
+                        output_dir=OUTPUT_DIR,
+                        stage=STAGE,
+                        kind="intra_latest",
+                        is_main_process=is_main_process,
+                    )
+                    # ------------------------------------------------------------
 
-             # >>> DEBUG: log tempi ogni LOG_EVERY step
+            # >>> DEBUG: log tempi ogni LOG_EVERY step
             if is_main_process and (global_step % LOG_EVERY == 0):
                 avg_loss = running_loss / LOG_EVERY
                 running_loss = 0.0
@@ -673,7 +896,8 @@ def main():
             # <<< DEBUG
 
             # >>> DEBUG: tempo fine step per misura data loading prossimo step
-            torch.cuda.synchronize()
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
             t_prev = time.perf_counter()
             # <<< DEBUG
 
@@ -698,6 +922,9 @@ def main():
         else:
             avg_train_loss_epoch = float("nan")
 
+        # Aggiungo la train_loss media per l'epoca alle metriche
+        metrics["train_loss"] = avg_train_loss_epoch
+
         if is_main_process:
             val_loss = metrics.get("val_loss", float("inf"))
             print(
@@ -705,9 +932,6 @@ def main():
                 f"train_loss: {avg_train_loss_epoch:.4f} | val_loss: {val_loss:.4f}"
             )
             
-        # Aggiungo la train_loss media per l'epoca alle metriche
-        metrics["train_loss"] = avg_train_loss_epoch
-
         # Log per epoca (loss + metriche)
         log_epoch_metrics(
             epoch=epoch,
@@ -729,15 +953,19 @@ def main():
                 best_val_loss = val_loss
                 epochs_no_improve = 0
 
-                save_checkpoint(
+                # ---- epoch_best (miglior modello) ----
+                save_lora_checkpoint(
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
                     epoch=epoch,
+                    step_in_epoch=None,
                     global_step=global_step,
                     best_val_loss=best_val_loss,
                     epochs_no_improve=epochs_no_improve,
                     output_dir=OUTPUT_DIR,
+                    stage=STAGE,
+                    kind="epoch_best",
                     is_main_process=is_main_process,
                 )
             else:
@@ -746,7 +974,29 @@ def main():
                     f"[INFO] val_loss did not improve (best={best_val_loss:.4f}), "
                     f"epochs_no_improve={epochs_no_improve}/{EARLY_STOPPING_PATIENCE}"
                 )
+                
+            # ---- epoch_latest (ultima epoca COMPLETATA) ----
+            save_lora_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                step_in_epoch=None,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+                epochs_no_improve=epochs_no_improve,
+                output_dir=OUTPUT_DIR,
+                stage=STAGE,
+                kind="epoch_latest",
+                is_main_process=is_main_process,
+            )
+            
+            # Dopo aver salvato epoch_latest, l'intra_latest non serve più
+            intra_dir = _get_stage_ckpt_dir(OUTPUT_DIR, STAGE, "intra_latest")
+            if intra_dir.exists():
+                shutil.rmtree(intra_dir, ignore_errors=True)
 
+            # Early stopping?
             if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
                 print(f"[INFO] Early stopping triggered at epoch {epoch}.")
                 stop_training = True

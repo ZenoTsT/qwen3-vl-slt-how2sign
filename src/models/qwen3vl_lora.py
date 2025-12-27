@@ -111,7 +111,13 @@ def load_qwen3vl_lora(
     )
 
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
+    
+    if stage == "stage2":
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    else:
+        model.gradient_checkpointing_enable()
 
     t3 = time.perf_counter()
     print(f"[TIMER] Base model loaded in {t3 - t2:.2f} seconds.")

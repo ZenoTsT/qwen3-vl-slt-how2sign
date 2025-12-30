@@ -29,8 +29,8 @@ mkdir -p outputs/qwen3vl_lora_how2sign/logs
 # Config eval
 # ------------------------------
 STAGE="stage2"
-SPLIT="val"
-MAX_SAMPLES=200
+SPLIT="test"
+MAX_SAMPLES=20
 MAX_NEW_TOKENS=64
 
 STAGE1_DIR="outputs/qwen3vl_lora_how2sign/checkpoints/stage1/epoch_best"

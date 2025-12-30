@@ -1,50 +1,54 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Eval script for Qwen3-VL LoRA checkpoints (How2Sign).
-- Computes BLEU-1/2/3/4 and ROUGE (rouge1/rouge2/rougeL).
-- Supports:
-    * stage1: load Stage1 LoRA adapter
-    * stage2: load Stage1 LoRA (merged/frozen) + Stage2 LoRA adapter (simultaneously, stacked)
-- Saves per-sample {video_path, ref, pred} to a JSONL file.
+Eval script for Qwen3-VL + LoRA checkpoints (How2Sign).
+- Loads Stage1 LoRA (optional) + Stage2 LoRA (optional) using your load_qwen3vl_lora()
+- Runs generation on a split (val/test/train) and saves JSONL with {video_path, ref, pred}
+- Computes BLEU1..4 + ROUGE-L **without sacrebleu** (so it's version-proof)
+- Adds a LOT of debug prints to verify the video actually reaches generate()
 
-Example (stage2 on val):
+USAGE EXAMPLE (similar to your logs):
 python scripts/eval_checkpoints.py \
   --stage stage2 \
-  --split val \
-  --max_samples 200 \
+  --split test \
+  --max_samples 20 \
   --stage1_dir outputs/qwen3vl_lora_how2sign/checkpoints/stage1/epoch_best \
   --stage2_dir outputs/qwen3vl_lora_how2sign/checkpoints/stage2/intra_latest \
-  --out_jsonl outputs/qwen3vl_lora_how2sign/logs/eval_stage2_val.jsonl
+  --out_jsonl outputs/qwen3vl_lora_how2sign/logs/eval_stage2_test_XXXX.jsonl
+
+NOTES:
+- This script assumes your dataset returns "videos" as list[str] paths, as in your training.
+- It assumes processor supports processor(videos=..., text=..., return_tensors="pt", padding=True, truncation=True)
 """
 
-import argparse
-import json
 import os
 import sys
+import json
 import time
+import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Dict, Any, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------
-# PYTHONPATH: add repo root so `from src...` works
+# PYTHONPATH: add repo root
 # ---------------------------------------------------------------------
-THIS_DIR = Path(__file__).resolve().parent          # .../scripts
-PROJECT_ROOT = THIS_DIR.parent                      # .../ (repo root)
+THIS_DIR = Path(__file__).resolve().parent                 # .../scripts
+PROJECT_ROOT = THIS_DIR.parent                             # repo root
+SRC_ROOT = PROJECT_ROOT / "src"
+
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.datasets.how2sign_loader import How2SignDataset, how2sign_collate_fn  # noqa: E402
-from src.models.qwen3vl_lora import load_qwen3vl_lora                          # noqa: E402
+from src.datasets.how2sign_loader import How2SignDataset, how2sign_collate_fn
+from src.models.qwen3vl_lora import load_qwen3vl_lora
 
 
 # ---------------------------------------------------------------------
-# Prompt: MUST match the one used during training
+# Prompt (must match what you used in training for the instruction)
 # ---------------------------------------------------------------------
 def build_instruction_prompt() -> str:
     return (
@@ -57,270 +61,361 @@ def build_instruction_prompt() -> str:
 
 
 # ---------------------------------------------------------------------
-# Metrics deps
+# Metrics (NO sacrebleu dependency) -> BLEU1..4 + ROUGE-L
 # ---------------------------------------------------------------------
-def _ensure_metrics_libs():
-    try:
-        import sacrebleu  # noqa
-    except Exception:
-        raise RuntimeError(
-            "Missing dependency: sacrebleu\n"
-            "Install with:\n"
-            "  pip install --user sacrebleu\n"
-        )
-    try:
-        from rouge_score import rouge_scorer  # noqa
-    except Exception:
-        raise RuntimeError(
-            "Missing dependency: rouge-score\n"
-            "Install with:\n"
-            "  pip install --user rouge-score\n"
-        )
+def _tokenize(s: str) -> List[str]:
+    # Simple + stable tokenizer (space split). Good enough for debugging/benchmark baseline.
+    # If you want 13a tokenization later, we can implement it too.
+    return s.strip().split()
 
 
-# ---------------------------------------------------------------------
-# BLEU / ROUGE implementations (robust to sacrebleu versions)
-# ---------------------------------------------------------------------
-def compute_bleu_1_4(preds: List[str], refs: List[str]) -> Dict[str, float]:
-    import sacrebleu
-
-    # sacrebleu expects list of hypotheses and list-of-lists of references
-    ref_list = [refs]
-
-    def bleu_with_order(order: int) -> float:
-        # Different sacrebleu versions have slightly different BLEU() signatures.
-        # We avoid passing use_effective_order (it broke on your cluster),
-        # and keep it simple + stable.
-        try:
-            metric = sacrebleu.metrics.BLEU(
-                ngram_order=order,
-                smooth_method="exp",
-                smooth_value=None,
-                force=False,
-                tokenize="13a",
-                lowercase=False,
-            )
-        except TypeError:
-            # Older versions might not support some kwargs
-            metric = sacrebleu.metrics.BLEU(
-                ngram_order=order,
-                smooth_method="exp",
-                tokenize="13a",
-            )
-
-        score = metric.corpus_score(preds, ref_list).score
-        return float(score)
-
-    return {
-        "BLEU1": bleu_with_order(1),
-        "BLEU2": bleu_with_order(2),
-        "BLEU3": bleu_with_order(3),
-        "BLEU4": bleu_with_order(4),
-    }
+def _ngram_counts(tokens: List[str], n: int) -> Dict[Tuple[str, ...], int]:
+    counts: Dict[Tuple[str, ...], int] = {}
+    if n <= 0:
+        return counts
+    for i in range(len(tokens) - n + 1):
+        ng = tuple(tokens[i : i + n])
+        counts[ng] = counts.get(ng, 0) + 1
+    return counts
 
 
-def compute_rouge(preds: List[str], refs: List[str]) -> Dict[str, float]:
-    from rouge_score import rouge_scorer
-
-    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
-
-    r1_f, r2_f, rl_f = 0.0, 0.0, 0.0
-    n = max(1, len(preds))
-
-    for p, r in zip(preds, refs):
-        s = scorer.score(r, p)  # score(reference, prediction)
-        r1_f += s["rouge1"].fmeasure
-        r2_f += s["rouge2"].fmeasure
-        rl_f += s["rougeL"].fmeasure
-
-    return {
-        "ROUGE1_F": float(r1_f / n),
-        "ROUGE2_F": float(r2_f / n),
-        "ROUGEL_F": float(rl_f / n),
-    }
-
-
-# ---------------------------------------------------------------------
-# Loading model with correct "stacking" of stage1+stage2 adapters
-# ---------------------------------------------------------------------
-def load_model_for_eval(
-    model_name: str,
-    stage: str,
-    device: str,
-    stage1_dir: str | None,
-    stage2_dir: str | None,
-):
+def _modified_precision(candidate: List[str], references: List[List[str]], n: int) -> Tuple[int, int]:
     """
-    stage1:
-      - attaches stage1 LoRA, then loads stage1 adapter weights
-    stage2:
-      - base model
-      - loads stage1 LoRA weights and merges/freeze into base (inside load_qwen3vl_lora stage2)
-      - attaches stage2 LoRA
-      - loads stage2 adapter weights
+    Returns (clipped_match_count, total_candidate_ngrams)
     """
-    stage = stage.lower().strip()
-    if stage not in {"stage1", "stage2"}:
-        raise ValueError(f"Invalid stage: {stage}")
+    cand_counts = _ngram_counts(candidate, n)
+    if not cand_counts:
+        return (0, 0)
 
-    if stage == "stage1":
-        if stage1_dir is None:
-            raise ValueError("stage1 requires --stage1_dir")
-        model, processor = load_qwen3vl_lora(
-            model_name=model_name,
-            r=16, alpha=32, dropout=0.05,
-            device=device,
-            stage="stage1",
-        )
-        # load adapter.pt into attached LoRA weights
-        adapter_path = Path(stage1_dir) / "adapter.pt"
-        if not adapter_path.exists():
-            raise FileNotFoundError(f"Missing stage1 adapter.pt at: {adapter_path}")
-        state = torch.load(adapter_path, map_location="cpu")
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[CKPT] Stage1 adapter loaded: missing={len(missing)}, unexpected={len(unexpected)}")
-        return model, processor
+    # max reference counts per ngram
+    max_ref_counts: Dict[Tuple[str, ...], int] = {}
+    for ref in references:
+        ref_counts = _ngram_counts(ref, n)
+        for ng, c in ref_counts.items():
+            prev = max_ref_counts.get(ng, 0)
+            if c > prev:
+                max_ref_counts[ng] = c
 
-    # stage2
-    if stage1_dir is None or stage2_dir is None:
-        raise ValueError("stage2 requires BOTH --stage1_dir and --stage2_dir")
+    clipped = 0
+    total = 0
+    for ng, c in cand_counts.items():
+        clipped += min(c, max_ref_counts.get(ng, 0))
+        total += c
+    return clipped, total
 
-    model, processor = load_qwen3vl_lora(
-        model_name=model_name,
-        r=16, alpha=32, dropout=0.05,
-        device=device,
-        stage="stage2",
-        stage1_adapter_dir=str(stage1_dir),  # <-- this is where stage1 is merged/frozen
-    )
 
-    adapter_path = Path(stage2_dir) / "adapter.pt"
-    if not adapter_path.exists():
-        raise FileNotFoundError(f"Missing stage2 adapter.pt at: {adapter_path}")
+def _closest_ref_length(cand_len: int, ref_lens: List[int]) -> int:
+    # Standard BLEU tie-breaking: choose closest, if tie choose shortest
+    best = ref_lens[0]
+    best_dist = abs(best - cand_len)
+    for rl in ref_lens[1:]:
+        dist = abs(rl - cand_len)
+        if dist < best_dist or (dist == best_dist and rl < best):
+            best = rl
+            best_dist = dist
+    return best
 
-    state = torch.load(adapter_path, map_location="cpu")
-    # The stage2 model is a PeftModel; loading LoRA keys should work non-strict
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    print(f"[CKPT] Stage2 adapter loaded: missing={len(missing)}, unexpected={len(unexpected)}")
-    return model, processor
+
+def corpus_bleu_n(
+    preds: List[str],
+    refs: List[str],
+    n: int,
+    smoothing_eps: float = 1e-9,
+) -> float:
+    """
+    Corpus BLEU with max order n (BLEU-n).
+    - Geometric mean over p1..pn
+    - Brevity penalty
+    - Add-epsilon smoothing on precisions to avoid log(0)
+    """
+    assert len(preds) == len(refs)
+    if len(preds) == 0:
+        return float("nan")
+
+    # Accumulate modified precisions across corpus
+    p_num = [0] * n
+    p_den = [0] * n
+    cand_len_sum = 0
+    ref_len_sum = 0
+
+    for pred, ref in zip(preds, refs):
+        cand_tok = _tokenize(pred)
+        ref_tok = _tokenize(ref)
+
+        cand_len_sum += len(cand_tok)
+        ref_len_sum += _closest_ref_length(len(cand_tok), [len(ref_tok)])
+
+        for k in range(1, n + 1):
+            cm, tot = _modified_precision(cand_tok, [ref_tok], k)
+            p_num[k - 1] += cm
+            p_den[k - 1] += tot
+
+    # If candidate length is 0, BLEU is 0
+    if cand_len_sum == 0:
+        return 0.0
+
+    # Precisions
+    import math
+    log_p_sum = 0.0
+    for k in range(n):
+        if p_den[k] == 0:
+            # no k-grams at all -> precision is 0 (smoothed)
+            p = smoothing_eps
+        else:
+            p = p_num[k] / p_den[k]
+            if p == 0.0:
+                p = smoothing_eps
+        log_p_sum += math.log(p)
+
+    geo_mean = math.exp(log_p_sum / n)
+
+    # Brevity penalty
+    if cand_len_sum > ref_len_sum:
+        bp = 1.0
+    else:
+        bp = math.exp(1.0 - (ref_len_sum / max(cand_len_sum, 1)))
+
+    return float(bp * geo_mean)
+
+
+def _lcs_length(a: List[str], b: List[str]) -> int:
+    # Dynamic programming LCS length (O(len(a)*len(b))) — OK for short sentences
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return 0
+    dp = [0] * (lb + 1)
+    for i in range(1, la + 1):
+        prev = 0
+        for j in range(1, lb + 1):
+            tmp = dp[j]
+            if a[i - 1] == b[j - 1]:
+                dp[j] = prev + 1
+            else:
+                dp[j] = max(dp[j], dp[j - 1])
+            prev = tmp
+    return dp[lb]
+
+
+def corpus_rouge_l(preds: List[str], refs: List[str]) -> float:
+    """
+    Simple corpus ROUGE-L F1 averaged over samples.
+    """
+    assert len(preds) == len(refs)
+    if len(preds) == 0:
+        return float("nan")
+
+    f1s = []
+    for pred, ref in zip(preds, refs):
+        p_tok = _tokenize(pred)
+        r_tok = _tokenize(ref)
+        if len(p_tok) == 0 or len(r_tok) == 0:
+            f1s.append(0.0)
+            continue
+        lcs = _lcs_length(p_tok, r_tok)
+        prec = lcs / len(p_tok)
+        rec = lcs / len(r_tok)
+        if prec + rec == 0:
+            f1 = 0.0
+        else:
+            f1 = (2 * prec * rec) / (prec + rec)
+        f1s.append(f1)
+
+    return float(sum(f1s) / len(f1s))
 
 
 # ---------------------------------------------------------------------
-# Generation
+# Helpers: loading LoRA adapters (only keys containing "lora_")
+# ---------------------------------------------------------------------
+def load_adapter_into_model_only_lora(model, adapter_path: Path, device: str) -> Tuple[int, int]:
+    """
+    Loads adapter.pt containing ONLY lora_ weights into model.state_dict().
+
+    Returns: (missing_count_like, unexpected_count_like) approximations:
+      - missing: how many lora_ keys in model are not provided
+      - unexpected: how many lora_ keys in adapter are not found in model
+    """
+    adapter_state = torch.load(adapter_path, map_location="cpu")
+
+    model_to_load = model.module if hasattr(model, "module") else model
+    model_state = model_to_load.state_dict()
+
+    model_lora_keys = {k for k in model_state.keys() if "lora_" in k}
+    adapter_keys = set(adapter_state.keys())
+
+    unexpected = 0
+    for k, v in adapter_state.items():
+        if k in model_state:
+            model_state[k] = v.to(device)
+        else:
+            unexpected += 1
+
+    model_to_load.load_state_dict(model_state, strict=False)
+
+    missing = len(model_lora_keys - adapter_keys)
+    return missing, unexpected
+
+
+# ---------------------------------------------------------------------
+# Core eval
 # ---------------------------------------------------------------------
 @torch.no_grad()
-def generate_predictions(
+def run_generation(
     model,
     processor,
-    dataloader,
     device: str,
+    loader: DataLoader,
+    out_jsonl: Path,
     max_samples: int,
     max_new_tokens: int,
-) -> Tuple[List[str], List[str], List[Dict]]:
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+    debug_first_n: int,
+) -> Dict[str, Any]:
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+    preds: List[str] = []
+    refs: List[str] = []
+
     model.eval()
 
-    preds_all: List[str] = []
-    refs_all: List[str] = []
-    rows: List[Dict] = []
+    # Try to find eos token id
+    eos_id = None
+    if hasattr(processor, "tokenizer") and hasattr(processor.tokenizer, "eos_token_id"):
+        eos_id = processor.tokenizer.eos_token_id
 
-    prompt = build_instruction_prompt()
-
-    seen = 0
+    n_done = 0
     t0 = time.time()
 
-    for batch in tqdm(dataloader, desc="Evaluating", total=max_samples if max_samples else None):
-        videos = batch["videos"]   # List[str]
-        refs = batch["texts"]      # List[str]
+    with out_jsonl.open("w", encoding="utf-8") as f:
+        pbar = tqdm(loader, total=min(max_samples, len(loader.dataset)), desc="Evaluating", dynamic_ncols=True)
 
-        # Stop if reached max_samples
-        if max_samples is not None and max_samples > 0:
-            if seen >= max_samples:
+        for batch_idx, batch in enumerate(pbar):
+            if n_done >= max_samples:
                 break
-            # If batch would exceed, truncate
-            if seen + len(videos) > max_samples:
-                cut = max_samples - seen
-                videos = videos[:cut]
-                refs = refs[:cut]
 
-        prompts = [prompt for _ in videos]
+            videos_batch: List[str] = batch["videos"]
+            texts_batch: List[str] = batch["texts"]
 
-        inputs = processor(
-            videos=videos,
-            text=prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+            # BATCH_SIZE in eval is normally 1; still we handle list
+            prompt = build_instruction_prompt()
+            prompts = [prompt] * len(videos_batch)
 
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # deterministic
-        )
+            # --- IMPORTANT: processor must create pixel_values_videos (or equivalent) ---
+            inputs = processor(
+                videos=videos_batch,
+                text=prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
 
-        decoded = processor.batch_decode(generated_ids, skip_special_tokens=True)
+            # -------------------- DEBUG (processor outputs) --------------------
+            if batch_idx == 0:
+                print("\n================ DEBUG: PROCESSOR OUTPUT (BATCH 0) ================")
+                print("processor keys:", list(inputs.keys()))
+                for k, v in inputs.items():
+                    if hasattr(v, "shape"):
+                        print(f"  {k}: shape={tuple(v.shape)} dtype={getattr(v,'dtype',None)}")
+                if "pixel_values_videos" not in inputs:
+                    print("[WARN] 'pixel_values_videos' NOT found in processor output. "
+                          "This often means you're generating text-only (video ignored).")
+                print("===================================================================\n")
 
-        for vp, ref, pred in zip(videos, refs, decoded):
-            # keep only what comes after "Translation:" if present
-            pred_clean = pred.split("Translation:")[-1].strip()
-            preds_all.append(pred_clean)
-            refs_all.append(ref)
-            rows.append({"video_path": vp, "ref": ref, "pred": pred_clean})
+            # Move tensors to device
+            inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-        seen += len(videos)
+            # -------------------- DEBUG: verify video tensor reaches generate --------------------
+            if batch_idx == 0:
+                has_vid = "pixel_values_videos" in inputs
+                print(f"[DEBUG] Will call generate() with pixel_values_videos present? {has_vid}")
 
-    t1 = time.time()
-    print(f"[INFO] Generation done in {t1 - t0:.1f}s for {seen} samples.")
-    return preds_all, refs_all, rows
+            # Generation config
+            gen_kwargs = dict(
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+            )
 
+            # Only add sampling params if do_sample=True (otherwise transformers may warn they are ignored)
+            if do_sample:
+                gen_kwargs.update(dict(
+                    temperature=temperature,
+                    top_p=top_p,
+                ))
 
-# ---------------------------------------------------------------------
-# IO
-# ---------------------------------------------------------------------
-def save_jsonl(rows: List[Dict], out_path: str):
-    out_path = str(out_path)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"[INFO] Saved predictions to: {out_path}")
+            # EOS if available
+            if eos_id is not None:
+                gen_kwargs["eos_token_id"] = eos_id
 
+            # IMPORTANT: pass the whole inputs dict to generate (includes pixel_values_videos)
+            generated_ids = model.generate(**inputs, **gen_kwargs)
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_name", type=str, default="Qwen/Qwen3-VL-4B-Instruct")
-    p.add_argument("--json_path", type=str, default="/work/tesi_ztesta/How2Sign_resized/how2sign_dataset_clean.json")
-    p.add_argument("--root_dir", type=str, default=str(PROJECT_ROOT))
-    p.add_argument("--split", type=str, choices=["train", "val", "test"], default="val")
+            # Decode
+            decoded = processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-    # IMPORTANT: must be provided (you hit this error)
-    p.add_argument("--stage", type=str, required=True, choices=["stage1", "stage2"])
+            # Postprocess: remove prompt if it leaks into output
+            cleaned: List[str] = []
+            for s in decoded:
+                s2 = s.strip()
+                # common cleanup if model repeats prompt:
+                if "Translation:" in s2:
+                    s2 = s2.split("Translation:", 1)[-1].strip()
+                cleaned.append(s2)
 
-    # checkpoint dirs (directories that contain adapter.pt)
-    p.add_argument("--stage1_dir", type=str, default=None)
-    p.add_argument("--stage2_dir", type=str, default=None)
+            # Save per item
+            for vp, ref, pred in zip(videos_batch, texts_batch, cleaned):
+                preds.append(pred)
+                refs.append(ref)
+                rec = {"video_path": vp, "ref": ref, "pred": pred}
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                n_done += 1
 
-    p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--max_samples", type=int, default=200)
-    p.add_argument("--max_new_tokens", type=int, default=64)
+                # -------------------- DEBUG: print some samples --------------------
+                if n_done <= debug_first_n:
+                    print("\n---------------- SAMPLE DEBUG ----------------")
+                    print("VIDEO:", vp)
+                    print("REF :", ref)
+                    print("PRED:", pred)
+                    print("---------------------------------------------\n")
 
-    p.add_argument("--out_jsonl", type=str, default=None)
+                if n_done >= max_samples:
+                    break
 
-    return p.parse_args()
+            pbar.set_postfix({"done": n_done})
+
+    dt = time.time() - t0
+    return {"n_samples": n_done, "seconds": dt, "preds": preds, "refs": refs}
 
 
 def main():
-    args = parse_args()
-    _ensure_metrics_libs()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-VL-4B-Instruct")
+    parser.add_argument("--stage", type=str, choices=["stage1", "stage2"], required=True)
+    parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
+    parser.add_argument("--max_samples", type=int, default=200)
+    parser.add_argument("--out_jsonl", type=str, required=True)
 
-    # Output jsonl default name
-    if args.out_jsonl is None:
-        out_dir = Path(PROJECT_ROOT) / "outputs" / "qwen3vl_lora_how2sign" / "logs"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        args.out_jsonl = str(out_dir / f"eval_{args.stage}_{args.split}.jsonl")
+    parser.add_argument("--stage1_dir", type=str, default=None, help="dir containing adapter.pt for stage1 epoch_best")
+    parser.add_argument("--stage2_dir", type=str, default=None, help="dir containing adapter.pt for stage2 (epoch_best/epoch_latest/intra_latest)")
+
+    parser.add_argument("--dataset_json", type=str, default=str(PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset_clean.json"))
+    parser.add_argument("--root_dir", type=str, default=str(PROJECT_ROOT))
+    parser.add_argument("--num_workers", type=int, default=2)
+
+    # generation params
+    parser.add_argument("--max_new_tokens", type=int, default=48)
+    parser.add_argument("--do_sample", action="store_true", help="enable sampling (otherwise greedy)")
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--repetition_penalty", type=float, default=1.2)
+
+    # debug
+    parser.add_argument("--debug_first_n", type=int, default=5, help="print first N predictions")
+    args = parser.parse_args()
+
+    out_jsonl = Path(args.out_jsonl)
 
     print("[INFO] Running eval:")
     print(f"  stage      = {args.stage}")
@@ -328,71 +423,121 @@ def main():
     print(f"  max_samples= {args.max_samples}")
     print(f"  stage1_dir = {args.stage1_dir}")
     print(f"  stage2_dir = {args.stage2_dir}")
-    print(f"  out_jsonl  = {args.out_jsonl}")
+    print(f"  out_jsonl  = {out_jsonl}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] device={device}")
 
-    # Load model + processor (with correct stage stacking)
-    model, processor = load_model_for_eval(
-        model_name=args.model_name,
-        stage=args.stage,
-        device=device,
-        stage1_dir=args.stage1_dir,
-        stage2_dir=args.stage2_dir,
-    )
+    # -----------------------------------------------------------------
+    # Load base + attach LoRA for chosen stage (your helper does this)
+    # -----------------------------------------------------------------
+    t0 = time.time()
+    if args.stage == "stage1":
+        model, processor = load_qwen3vl_lora(
+            model_name=args.model_name,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
+            stage="stage1",
+        )
+    else:
+        # Stage2: you likely want to merge stage1 LoRA first (for your 2-stage setup)
+        model, processor = load_qwen3vl_lora(
+            model_name=args.model_name,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
+            stage="stage2",
+            stage1_adapter_dir=args.stage1_dir,
+        )
+    print(f"[TIMER] Total load_qwen3vl_lora() time: {time.time() - t0:.2f}s")
 
-    # Dataset / loader
+    # -----------------------------------------------------------------
+    # Load Stage2 adapter weights (ONLY LoRA keys) if provided
+    # -----------------------------------------------------------------
+    if args.stage2_dir is not None:
+        adapter_path = Path(args.stage2_dir) / "adapter.pt"
+        if not adapter_path.exists():
+            raise FileNotFoundError(f"Stage2 adapter not found: {adapter_path}")
+        missing, unexpected = load_adapter_into_model_only_lora(model, adapter_path, device=device)
+        print(f"[CKPT] Stage2 adapter loaded: missing={missing}, unexpected={unexpected}")
+
+    # -----------------------------------------------------------------
+    # Dataset
+    # -----------------------------------------------------------------
     ds = How2SignDataset(
-        json_path=args.json_path,
+        json_path=str(args.dataset_json),
         split=args.split,
-        root_dir=args.root_dir,
+        root_dir=str(args.root_dir),
         return_type="video",
     )
     print(f"[How2SignDataset] split={args.split} | num_samples={len(ds)}")
-    print(f"[How2SignDataset] json_path={args.json_path}")
+    print(f"[How2SignDataset] json_path={args.dataset_json}")
     print(f"[How2SignDataset] root_dir={args.root_dir}")
 
-    dl = DataLoader(
+    loader = DataLoader(
         ds,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
-        num_workers=2,
+        num_workers=args.num_workers,
         collate_fn=how2sign_collate_fn,
         pin_memory=(device == "cuda"),
     )
 
-    # Generate
-    preds, refs, rows = generate_predictions(
+    # -----------------------------------------------------------------
+    # Run generation + save jsonl
+    # -----------------------------------------------------------------
+    gen = run_generation(
         model=model,
         processor=processor,
-        dataloader=dl,
         device=device,
+        loader=loader,
+        out_jsonl=out_jsonl,
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
+        do_sample=args.do_sample,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        debug_first_n=args.debug_first_n,
     )
 
-    # Save predictions
-    save_jsonl(rows, args.out_jsonl)
+    print(f"[INFO] Generation done in {gen['seconds']:.1f}s for {gen['n_samples']} samples.")
+    print(f"[INFO] Saved predictions to: {out_jsonl}")
 
-    # Metrics
-    bleu = compute_bleu_1_4(preds, refs)
-    rouge = compute_rouge(preds, refs)
+    preds = gen["preds"]
+    refs = gen["refs"]
 
-    metrics = {**bleu, **rouge}
-    print("\n================= METRICS =================")
+    # -----------------------------------------------------------------
+    # Metrics (BLEU1..4 + ROUGE-L)
+    # -----------------------------------------------------------------
+    bleu1 = corpus_bleu_n(preds, refs, n=1)
+    bleu2 = corpus_bleu_n(preds, refs, n=2)
+    bleu3 = corpus_bleu_n(preds, refs, n=3)
+    bleu4 = corpus_bleu_n(preds, refs, n=4)
+    rouge_l = corpus_rouge_l(preds, refs)
+
+    metrics = {
+        "split": args.split,
+        "stage": args.stage,
+        "n_samples": gen["n_samples"],
+        "BLEU1": bleu1,
+        "BLEU2": bleu2,
+        "BLEU3": bleu3,
+        "BLEU4": bleu4,
+        "ROUGE_L_F1": rouge_l,
+    }
+
+    print("\n================ METRICS ================")
     for k, v in metrics.items():
-        # BLEU in [0,100], ROUGE_F in [0,1]
-        if k.startswith("ROUGE"):
-            print(f"{k:10s}: {v:.4f}")
+        if isinstance(v, float):
+            print(f"{k:>12}: {v:.6f}")
         else:
-            print(f"{k:10s}: {v:.2f}")
-    print("===========================================\n")
+            print(f"{k:>12}: {v}")
+    print("=========================================\n")
 
-    # Also save metrics next to jsonl
-    metrics_path = str(Path(args.out_jsonl).with_suffix(".metrics.json"))
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+    # Save metrics next to jsonl
+    metrics_path = out_jsonl.with_suffix(".metrics.json")
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
     print(f"[INFO] Saved metrics to: {metrics_path}")
 
 

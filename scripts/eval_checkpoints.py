@@ -255,7 +255,12 @@ def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[st
     t0 = time.time()
 
     with OUT_JSONL.open("w", encoding="utf-8") as f:
-        pbar = tqdm(loader, total=min(MAX_SAMPLES, len(loader.dataset)), desc="Evaluating", dynamic_ncols=True)
+        pbar = tqdm(
+            loader,
+            total=min(MAX_SAMPLES, len(loader.dataset)),
+            desc="Evaluating",
+            dynamic_ncols=True,
+        )
 
         for batch_idx, batch in enumerate(pbar):
             if n_done >= MAX_SAMPLES:
@@ -264,15 +269,51 @@ def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[st
             videos_batch: List[str] = batch["videos"]
             texts_batch: List[str] = batch["texts"]
 
-            prompt = build_instruction_prompt()
-            prompts = [prompt] * len(videos_batch)
+            # ------------------------------------------------------------
+            # Build prompts using Qwen-VL chat template (video + instruction)
+            # ------------------------------------------------------------
+            instruction = build_instruction_prompt()
+            chat_texts: List[str] = []
 
+            if hasattr(processor, "apply_chat_template"):
+                for vp in videos_batch:
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "video", "video": vp},
+                                {"type": "text", "text": instruction},
+                            ],
+                        }
+                    ]
+                    txt = processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,  # adds assistant slot
+                    )
+                    chat_texts.append(txt)
+            else:
+                # fallback (less ideal)
+                chat_texts = [instruction] * len(videos_batch)
+
+            # DEBUG: show final prompt once
+            if batch_idx == 0:
+                print("\n================ DEBUG: CHAT TEMPLATE (FIRST SAMPLE) ================")
+                print(chat_texts[0])
+                print("=====================================================================\n")
+
+            # ------------------------------------------------------------
+            # Processor: pass BOTH videos and chat-text
+            # ------------------------------------------------------------
             inputs = processor(
                 videos=videos_batch,
-                text=prompts,
+                text=chat_texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
+                # Se vuoi forzare frames/fps per debug, decommenta:
+                # num_frames=32,
+                # fps=2.0,
             )
 
             # DEBUG: show processor outputs once
@@ -283,8 +324,10 @@ def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[st
                     if hasattr(v, "shape"):
                         print(f"  {k}: shape={tuple(v.shape)} dtype={getattr(v,'dtype',None)}")
                 if "pixel_values_videos" not in inputs:
-                    print("[WARN] 'pixel_values_videos' NOT found in processor output. "
-                          "This may mean the video is not being used.")
+                    print(
+                        "[WARN] 'pixel_values_videos' NOT found in processor output. "
+                        "This may mean the video is not being used."
+                    )
                 print("===================================================================\n")
 
             inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
@@ -292,6 +335,9 @@ def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[st
             if batch_idx == 0:
                 print(f"[DEBUG] generate() called with pixel_values_videos present? {'pixel_values_videos' in inputs}")
 
+            # ------------------------------------------------------------
+            # Generate
+            # ------------------------------------------------------------
             gen_kwargs = dict(
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=DO_SAMPLE,
@@ -305,17 +351,33 @@ def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[st
             generated_ids = model.generate(**inputs, **gen_kwargs)
             decoded = processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
+            # ------------------------------------------------------------
+            # Clean: keep ONLY assistant answer, robustly
+            # ------------------------------------------------------------
             cleaned: List[str] = []
             for s in decoded:
                 s2 = s.strip()
+
+                # If the old marker exists, cut after it
                 if "Translation:" in s2:
                     s2 = s2.split("Translation:", 1)[-1].strip()
+
+                # If chat markers remain, take the tail
+                for marker in ["assistant\n", "assistant:", "Assistant:", "ASSISTANT:"]:
+                    if marker in s2:
+                        s2 = s2.split(marker, 1)[-1].strip()
+
                 cleaned.append(s2)
 
+            # ------------------------------------------------------------
+            # Save per-sample
+            # ------------------------------------------------------------
             for vp, ref, pred in zip(videos_batch, texts_batch, cleaned):
                 preds.append(pred)
                 refs.append(ref)
-                f.write(json.dumps({"video_path": vp, "ref": ref, "pred": pred}, ensure_ascii=False) + "\n")
+                f.write(
+                    json.dumps({"video_path": vp, "ref": ref, "pred": pred}, ensure_ascii=False) + "\n"
+                )
                 n_done += 1
 
                 if n_done <= DEBUG_FIRST_N:

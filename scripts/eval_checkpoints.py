@@ -1,31 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Eval script for Qwen3-VL + LoRA checkpoints (How2Sign).
-- Loads Stage1 LoRA (optional) + Stage2 LoRA (optional) using your load_qwen3vl_lora()
-- Runs generation on a split (val/test/train) and saves JSONL with {video_path, ref, pred}
-- Computes BLEU1..4 + ROUGE-L **without sacrebleu** (so it's version-proof)
-- Adds a LOT of debug prints to verify the video actually reaches generate()
-
-USAGE EXAMPLE (similar to your logs):
-python scripts/eval_checkpoints.py \
-  --stage stage2 \
-  --split test \
-  --max_samples 20 \
-  --stage1_dir outputs/qwen3vl_lora_how2sign/checkpoints/stage1/epoch_best \
-  --stage2_dir outputs/qwen3vl_lora_how2sign/checkpoints/stage2/intra_latest \
-  --out_jsonl outputs/qwen3vl_lora_how2sign/logs/eval_stage2_test_XXXX.jsonl
-
-NOTES:
-- This script assumes your dataset returns "videos" as list[str] paths, as in your training.
-- It assumes processor supports processor(videos=..., text=..., return_tensors="pt", padding=True, truncation=True)
-"""
 
 import os
 import sys
 import json
 import time
-import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
@@ -38,7 +17,6 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------
 THIS_DIR = Path(__file__).resolve().parent                 # .../scripts
 PROJECT_ROOT = THIS_DIR.parent                             # repo root
-SRC_ROOT = PROJECT_ROOT / "src"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
@@ -48,7 +26,47 @@ from src.models.qwen3vl_lora import load_qwen3vl_lora
 
 
 # ---------------------------------------------------------------------
-# Prompt (must match what you used in training for the instruction)
+# HARD-CODED CONFIG (NO PARAMS)
+# ---------------------------------------------------------------------
+MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
+
+# Always test split (as you requested)
+SPLIT = "test"
+
+# Always stage2 in your current setup; change if needed
+STAGE = "stage2"  # "stage1" or "stage2"
+
+# Max samples for quick debug
+MAX_SAMPLES = 20
+
+# Generation
+MAX_NEW_TOKENS = 48
+DO_SAMPLE = False            # greedy by default (stable)
+TEMPERATURE = 0.7            # used only if DO_SAMPLE=True
+TOP_P = 0.9                  # used only if DO_SAMPLE=True
+REPETITION_PENALTY = 1.2
+
+# Debug prints
+DEBUG_FIRST_N = 5
+
+# Paths
+DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset_clean.json"
+ROOT_DIR = PROJECT_ROOT
+
+OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
+OUT_JSONL = OUTPUT_DIR / "logs" / f"eval_{STAGE}_{SPLIT}_{os.environ.get('SLURM_JOB_ID', 'local')}.jsonl"
+
+# Stage adapters
+STAGE1_DIR = OUTPUT_DIR / "checkpoints" / "stage1" / "epoch_best"
+STAGE2_DIR = OUTPUT_DIR / "checkpoints" / "stage2" / "intra_latest"
+
+# Loader
+NUM_WORKERS = 2
+BATCH_SIZE = 1  # fixed; no CLI
+
+
+# ---------------------------------------------------------------------
+# Prompt (must match training instruction)
 # ---------------------------------------------------------------------
 def build_instruction_prompt() -> str:
     return (
@@ -61,11 +79,9 @@ def build_instruction_prompt() -> str:
 
 
 # ---------------------------------------------------------------------
-# Metrics (NO sacrebleu dependency) -> BLEU1..4 + ROUGE-L
+# Metrics (NO sacrebleu) -> BLEU1..4 + ROUGE-L
 # ---------------------------------------------------------------------
 def _tokenize(s: str) -> List[str]:
-    # Simple + stable tokenizer (space split). Good enough for debugging/benchmark baseline.
-    # If you want 13a tokenization later, we can implement it too.
     return s.strip().split()
 
 
@@ -80,14 +96,10 @@ def _ngram_counts(tokens: List[str], n: int) -> Dict[Tuple[str, ...], int]:
 
 
 def _modified_precision(candidate: List[str], references: List[List[str]], n: int) -> Tuple[int, int]:
-    """
-    Returns (clipped_match_count, total_candidate_ngrams)
-    """
     cand_counts = _ngram_counts(candidate, n)
     if not cand_counts:
         return (0, 0)
 
-    # max reference counts per ngram
     max_ref_counts: Dict[Tuple[str, ...], int] = {}
     for ref in references:
         ref_counts = _ngram_counts(ref, n)
@@ -105,7 +117,6 @@ def _modified_precision(candidate: List[str], references: List[List[str]], n: in
 
 
 def _closest_ref_length(cand_len: int, ref_lens: List[int]) -> int:
-    # Standard BLEU tie-breaking: choose closest, if tie choose shortest
     best = ref_lens[0]
     best_dist = abs(best - cand_len)
     for rl in ref_lens[1:]:
@@ -116,23 +127,13 @@ def _closest_ref_length(cand_len: int, ref_lens: List[int]) -> int:
     return best
 
 
-def corpus_bleu_n(
-    preds: List[str],
-    refs: List[str],
-    n: int,
-    smoothing_eps: float = 1e-9,
-) -> float:
-    """
-    Corpus BLEU with max order n (BLEU-n).
-    - Geometric mean over p1..pn
-    - Brevity penalty
-    - Add-epsilon smoothing on precisions to avoid log(0)
-    """
+def corpus_bleu_n(preds: List[str], refs: List[str], n: int, smoothing_eps: float = 1e-9) -> float:
     assert len(preds) == len(refs)
     if len(preds) == 0:
         return float("nan")
 
-    # Accumulate modified precisions across corpus
+    import math
+
     p_num = [0] * n
     p_den = [0] * n
     cand_len_sum = 0
@@ -150,16 +151,12 @@ def corpus_bleu_n(
             p_num[k - 1] += cm
             p_den[k - 1] += tot
 
-    # If candidate length is 0, BLEU is 0
     if cand_len_sum == 0:
         return 0.0
 
-    # Precisions
-    import math
     log_p_sum = 0.0
     for k in range(n):
         if p_den[k] == 0:
-            # no k-grams at all -> precision is 0 (smoothed)
             p = smoothing_eps
         else:
             p = p_num[k] / p_den[k]
@@ -169,7 +166,6 @@ def corpus_bleu_n(
 
     geo_mean = math.exp(log_p_sum / n)
 
-    # Brevity penalty
     if cand_len_sum > ref_len_sum:
         bp = 1.0
     else:
@@ -179,7 +175,6 @@ def corpus_bleu_n(
 
 
 def _lcs_length(a: List[str], b: List[str]) -> int:
-    # Dynamic programming LCS length (O(len(a)*len(b))) — OK for short sentences
     la, lb = len(a), len(b)
     if la == 0 or lb == 0:
         return 0
@@ -197,9 +192,6 @@ def _lcs_length(a: List[str], b: List[str]) -> int:
 
 
 def corpus_rouge_l(preds: List[str], refs: List[str]) -> float:
-    """
-    Simple corpus ROUGE-L F1 averaged over samples.
-    """
     assert len(preds) == len(refs)
     if len(preds) == 0:
         return float("nan")
@@ -214,26 +206,16 @@ def corpus_rouge_l(preds: List[str], refs: List[str]) -> float:
         lcs = _lcs_length(p_tok, r_tok)
         prec = lcs / len(p_tok)
         rec = lcs / len(r_tok)
-        if prec + rec == 0:
-            f1 = 0.0
-        else:
-            f1 = (2 * prec * rec) / (prec + rec)
+        f1 = 0.0 if (prec + rec) == 0 else (2 * prec * rec) / (prec + rec)
         f1s.append(f1)
 
     return float(sum(f1s) / len(f1s))
 
 
 # ---------------------------------------------------------------------
-# Helpers: loading LoRA adapters (only keys containing "lora_")
+# Adapter loading (only lora_ keys)
 # ---------------------------------------------------------------------
 def load_adapter_into_model_only_lora(model, adapter_path: Path, device: str) -> Tuple[int, int]:
-    """
-    Loads adapter.pt containing ONLY lora_ weights into model.state_dict().
-
-    Returns: (missing_count_like, unexpected_count_like) approximations:
-      - missing: how many lora_ keys in model are not provided
-      - unexpected: how many lora_ keys in adapter are not found in model
-    """
     adapter_state = torch.load(adapter_path, map_location="cpu")
 
     model_to_load = model.module if hasattr(model, "module") else model
@@ -256,53 +238,35 @@ def load_adapter_into_model_only_lora(model, adapter_path: Path, device: str) ->
 
 
 # ---------------------------------------------------------------------
-# Core eval
+# Generation
 # ---------------------------------------------------------------------
 @torch.no_grad()
-def run_generation(
-    model,
-    processor,
-    device: str,
-    loader: DataLoader,
-    out_jsonl: Path,
-    max_samples: int,
-    max_new_tokens: int,
-    do_sample: bool,
-    temperature: float,
-    top_p: float,
-    repetition_penalty: float,
-    debug_first_n: int,
-) -> Dict[str, Any]:
-    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[str, Any]:
+    OUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
 
     preds: List[str] = []
     refs: List[str] = []
 
     model.eval()
 
-    # Try to find eos token id
-    eos_id = None
-    if hasattr(processor, "tokenizer") and hasattr(processor.tokenizer, "eos_token_id"):
-        eos_id = processor.tokenizer.eos_token_id
+    eos_id = getattr(getattr(processor, "tokenizer", None), "eos_token_id", None)
 
     n_done = 0
     t0 = time.time()
 
-    with out_jsonl.open("w", encoding="utf-8") as f:
-        pbar = tqdm(loader, total=min(max_samples, len(loader.dataset)), desc="Evaluating", dynamic_ncols=True)
+    with OUT_JSONL.open("w", encoding="utf-8") as f:
+        pbar = tqdm(loader, total=min(MAX_SAMPLES, len(loader.dataset)), desc="Evaluating", dynamic_ncols=True)
 
         for batch_idx, batch in enumerate(pbar):
-            if n_done >= max_samples:
+            if n_done >= MAX_SAMPLES:
                 break
 
             videos_batch: List[str] = batch["videos"]
             texts_batch: List[str] = batch["texts"]
 
-            # BATCH_SIZE in eval is normally 1; still we handle list
             prompt = build_instruction_prompt()
             prompts = [prompt] * len(videos_batch)
 
-            # --- IMPORTANT: processor must create pixel_values_videos (or equivalent) ---
             inputs = processor(
                 videos=videos_batch,
                 text=prompts,
@@ -311,7 +275,7 @@ def run_generation(
                 truncation=True,
             )
 
-            # -------------------- DEBUG (processor outputs) --------------------
+            # DEBUG: show processor outputs once
             if batch_idx == 0:
                 print("\n================ DEBUG: PROCESSOR OUTPUT (BATCH 0) ================")
                 print("processor keys:", list(inputs.keys()))
@@ -320,67 +284,48 @@ def run_generation(
                         print(f"  {k}: shape={tuple(v.shape)} dtype={getattr(v,'dtype',None)}")
                 if "pixel_values_videos" not in inputs:
                     print("[WARN] 'pixel_values_videos' NOT found in processor output. "
-                          "This often means you're generating text-only (video ignored).")
+                          "This may mean the video is not being used.")
                 print("===================================================================\n")
 
-            # Move tensors to device
             inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-            # -------------------- DEBUG: verify video tensor reaches generate --------------------
             if batch_idx == 0:
-                has_vid = "pixel_values_videos" in inputs
-                print(f"[DEBUG] Will call generate() with pixel_values_videos present? {has_vid}")
+                print(f"[DEBUG] generate() called with pixel_values_videos present? {'pixel_values_videos' in inputs}")
 
-            # Generation config
             gen_kwargs = dict(
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                repetition_penalty=repetition_penalty,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=DO_SAMPLE,
+                repetition_penalty=REPETITION_PENALTY,
             )
-
-            # Only add sampling params if do_sample=True (otherwise transformers may warn they are ignored)
-            if do_sample:
-                gen_kwargs.update(dict(
-                    temperature=temperature,
-                    top_p=top_p,
-                ))
-
-            # EOS if available
+            if DO_SAMPLE:
+                gen_kwargs.update(dict(temperature=TEMPERATURE, top_p=TOP_P))
             if eos_id is not None:
                 gen_kwargs["eos_token_id"] = eos_id
 
-            # IMPORTANT: pass the whole inputs dict to generate (includes pixel_values_videos)
             generated_ids = model.generate(**inputs, **gen_kwargs)
-
-            # Decode
             decoded = processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-            # Postprocess: remove prompt if it leaks into output
             cleaned: List[str] = []
             for s in decoded:
                 s2 = s.strip()
-                # common cleanup if model repeats prompt:
                 if "Translation:" in s2:
                     s2 = s2.split("Translation:", 1)[-1].strip()
                 cleaned.append(s2)
 
-            # Save per item
             for vp, ref, pred in zip(videos_batch, texts_batch, cleaned):
                 preds.append(pred)
                 refs.append(ref)
-                rec = {"video_path": vp, "ref": ref, "pred": pred}
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.write(json.dumps({"video_path": vp, "ref": ref, "pred": pred}, ensure_ascii=False) + "\n")
                 n_done += 1
 
-                # -------------------- DEBUG: print some samples --------------------
-                if n_done <= debug_first_n:
+                if n_done <= DEBUG_FIRST_N:
                     print("\n---------------- SAMPLE DEBUG ----------------")
                     print("VIDEO:", vp)
                     print("REF :", ref)
                     print("PRED:", pred)
                     print("---------------------------------------------\n")
 
-                if n_done >= max_samples:
+                if n_done >= MAX_SAMPLES:
                     break
 
             pbar.set_postfix({"done": n_done})
@@ -390,125 +335,77 @@ def run_generation(
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-VL-4B-Instruct")
-    parser.add_argument("--stage", type=str, choices=["stage1", "stage2"], required=True)
-    parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
-    parser.add_argument("--max_samples", type=int, default=200)
-    parser.add_argument("--out_jsonl", type=str, required=True)
+    # IMPORTANT: ignore any CLI args to avoid failures from extra flags in wrappers
+    # (we just don't parse them at all)
 
-    parser.add_argument("--stage1_dir", type=str, default=None, help="dir containing adapter.pt for stage1 epoch_best")
-    parser.add_argument("--stage2_dir", type=str, default=None, help="dir containing adapter.pt for stage2 (epoch_best/epoch_latest/intra_latest)")
-
-    parser.add_argument("--dataset_json", type=str, default=str(PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset_clean.json"))
-    parser.add_argument("--root_dir", type=str, default=str(PROJECT_ROOT))
-    parser.add_argument("--num_workers", type=int, default=2)
-
-    # generation params
-    parser.add_argument("--max_new_tokens", type=int, default=48)
-    parser.add_argument("--do_sample", action="store_true", help="enable sampling (otherwise greedy)")
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top_p", type=float, default=0.9)
-    parser.add_argument("--repetition_penalty", type=float, default=1.2)
-
-    # debug
-    parser.add_argument("--debug_first_n", type=int, default=5, help="print first N predictions")
-    args = parser.parse_args()
-
-    out_jsonl = Path(args.out_jsonl)
-
-    print("[INFO] Running eval:")
-    print(f"  stage      = {args.stage}")
-    print(f"  split      = {args.split}")
-    print(f"  max_samples= {args.max_samples}")
-    print(f"  stage1_dir = {args.stage1_dir}")
-    print(f"  stage2_dir = {args.stage2_dir}")
-    print(f"  out_jsonl  = {out_jsonl}")
+    print("[INFO] Running eval (NO PARAMS):")
+    print(f"  stage      = {STAGE}")
+    print(f"  split      = {SPLIT}")
+    print(f"  max_samples= {MAX_SAMPLES}")
+    print(f"  stage1_dir = {STAGE1_DIR}")
+    print(f"  stage2_dir = {STAGE2_DIR}")
+    print(f"  out_jsonl  = {OUT_JSONL}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] device={device}")
 
-    # -----------------------------------------------------------------
-    # Load base + attach LoRA for chosen stage (your helper does this)
-    # -----------------------------------------------------------------
+    # Load model + processor
     t0 = time.time()
-    if args.stage == "stage1":
+    if STAGE == "stage1":
         model, processor = load_qwen3vl_lora(
-            model_name=args.model_name,
+            model_name=MODEL_NAME,
             r=16, alpha=32, dropout=0.05,
             device=device,
             stage="stage1",
         )
     else:
-        # Stage2: you likely want to merge stage1 LoRA first (for your 2-stage setup)
         model, processor = load_qwen3vl_lora(
-            model_name=args.model_name,
+            model_name=MODEL_NAME,
             r=16, alpha=32, dropout=0.05,
             device=device,
             stage="stage2",
-            stage1_adapter_dir=args.stage1_dir,
+            stage1_adapter_dir=str(STAGE1_DIR),
         )
-    print(f"[TIMER] Total load_qwen3vl_lora() time: {time.time() - t0:.2f}s")
+    print(f"[TIMER] load_qwen3vl_lora() time: {time.time() - t0:.2f}s")
 
-    # -----------------------------------------------------------------
-    # Load Stage2 adapter weights (ONLY LoRA keys) if provided
-    # -----------------------------------------------------------------
-    if args.stage2_dir is not None:
-        adapter_path = Path(args.stage2_dir) / "adapter.pt"
-        if not adapter_path.exists():
-            raise FileNotFoundError(f"Stage2 adapter not found: {adapter_path}")
-        missing, unexpected = load_adapter_into_model_only_lora(model, adapter_path, device=device)
-        print(f"[CKPT] Stage2 adapter loaded: missing={missing}, unexpected={unexpected}")
+    # Load stage2 adapter (only lora_ weights)
+    if STAGE2_DIR is not None:
+        adapter_path = Path(STAGE2_DIR) / "adapter.pt"
+        if adapter_path.exists():
+            missing, unexpected = load_adapter_into_model_only_lora(model, adapter_path, device=device)
+            print(f"[CKPT] Stage2 adapter loaded: missing={missing}, unexpected={unexpected}")
+        else:
+            print(f"[WARN] Stage2 adapter not found at: {adapter_path} (continuing without stage2 adapter)")
 
-    # -----------------------------------------------------------------
-    # Dataset
-    # -----------------------------------------------------------------
+    # Dataset (forced test)
     ds = How2SignDataset(
-        json_path=str(args.dataset_json),
-        split=args.split,
-        root_dir=str(args.root_dir),
+        json_path=str(DATASET_JSON),
+        split=SPLIT,
+        root_dir=str(ROOT_DIR),
         return_type="video",
     )
-    print(f"[How2SignDataset] split={args.split} | num_samples={len(ds)}")
-    print(f"[How2SignDataset] json_path={args.dataset_json}")
-    print(f"[How2SignDataset] root_dir={args.root_dir}")
+    print(f"[How2SignDataset] split={SPLIT} | num_samples={len(ds)}")
+    print(f"[How2SignDataset] json_path={DATASET_JSON}")
+    print(f"[How2SignDataset] root_dir={ROOT_DIR}")
 
     loader = DataLoader(
         ds,
-        batch_size=1,
+        batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=NUM_WORKERS,
         collate_fn=how2sign_collate_fn,
         pin_memory=(device == "cuda"),
     )
 
-    # -----------------------------------------------------------------
-    # Run generation + save jsonl
-    # -----------------------------------------------------------------
-    gen = run_generation(
-        model=model,
-        processor=processor,
-        device=device,
-        loader=loader,
-        out_jsonl=out_jsonl,
-        max_samples=args.max_samples,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=args.do_sample,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty,
-        debug_first_n=args.debug_first_n,
-    )
-
+    # Generate
+    gen = run_generation(model, processor, device=device, loader=loader)
     print(f"[INFO] Generation done in {gen['seconds']:.1f}s for {gen['n_samples']} samples.")
-    print(f"[INFO] Saved predictions to: {out_jsonl}")
+    print(f"[INFO] Saved predictions to: {OUT_JSONL}")
 
     preds = gen["preds"]
     refs = gen["refs"]
 
-    # -----------------------------------------------------------------
-    # Metrics (BLEU1..4 + ROUGE-L)
-    # -----------------------------------------------------------------
+    # Metrics
     bleu1 = corpus_bleu_n(preds, refs, n=1)
     bleu2 = corpus_bleu_n(preds, refs, n=2)
     bleu3 = corpus_bleu_n(preds, refs, n=3)
@@ -516,8 +413,8 @@ def main():
     rouge_l = corpus_rouge_l(preds, refs)
 
     metrics = {
-        "split": args.split,
-        "stage": args.stage,
+        "split": SPLIT,
+        "stage": STAGE,
         "n_samples": gen["n_samples"],
         "BLEU1": bleu1,
         "BLEU2": bleu2,
@@ -534,8 +431,7 @@ def main():
             print(f"{k:>12}: {v}")
     print("=========================================\n")
 
-    # Save metrics next to jsonl
-    metrics_path = out_jsonl.with_suffix(".metrics.json")
+    metrics_path = OUT_JSONL.with_suffix(".metrics.json")
     with metrics_path.open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
     print(f"[INFO] Saved metrics to: {metrics_path}")

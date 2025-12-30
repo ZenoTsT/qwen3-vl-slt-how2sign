@@ -3,7 +3,7 @@
 #SBATCH --output=logs/eval_%j.out
 #SBATCH --error=logs/eval_%j.err
 #SBATCH --account=tesi_ztesta
-#SBATCH --partition=boost_usr_prod
+#SBATCH --partition=all_usr_prod
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
@@ -25,36 +25,14 @@ export PYTHONPATH=/homes/ztesta/qwen3-vl-slt-how2sign:$PYTHONPATH
 mkdir -p logs
 mkdir -p outputs/qwen3vl_lora_how2sign/logs
 
-# ------------------------------
-# Config eval
-# ------------------------------
-STAGE="stage2"
-SPLIT="test"
-MAX_SAMPLES=20
-MAX_NEW_TOKENS=64
-
-STAGE1_DIR="outputs/qwen3vl_lora_how2sign/checkpoints/stage1/epoch_best"
-STAGE2_DIR="outputs/qwen3vl_lora_how2sign/checkpoints/stage2/intra_latest"
-
-OUT_JSONL="outputs/qwen3vl_lora_how2sign/logs/eval_${STAGE}_${SPLIT}_${SLURM_JOB_ID}.jsonl"
-
 # (Consigliato) log più puliti / meno warning
 export TOKENIZERS_PARALLELISM=false
 
-echo "[INFO] Running eval:"
-echo "  stage      = ${STAGE}"
-echo "  split      = ${SPLIT}"
-echo "  max_samples= ${MAX_SAMPLES}"
-echo "  stage1_dir = ${STAGE1_DIR}"
-echo "  stage2_dir = ${STAGE2_DIR}"
-echo "  out_jsonl  = ${OUT_JSONL}"
+# Se vuoi silenziare un po' transformers:
+# export TRANSFORMERS_VERBOSITY=error
 
-python scripts/eval_checkpoints.py \
-  --stage "${STAGE}" \
-  --stage1_dir "${STAGE1_DIR}" \
-  --stage2_dir "${STAGE2_DIR}" \
-  --split "${SPLIT}" \
-  --batch_size 1 \
-  --max_samples "${MAX_SAMPLES}" \
-  --max_new_tokens "${MAX_NEW_TOKENS}" \
-  --out_jsonl "${OUT_JSONL}"
+echo "[INFO] Running eval (NO PARAMS)."
+echo "[INFO] Script: scripts/eval_checkpoints.py"
+echo "[INFO] NOTE: split is forced to TEST inside the script."
+
+python -u scripts/eval_checkpoints.py

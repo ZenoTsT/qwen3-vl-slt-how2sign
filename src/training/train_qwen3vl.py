@@ -103,49 +103,46 @@ def build_training_text(target_text: str) -> str:
 
 def mask_prompt_tokens(labels: torch.Tensor, input_ids: torch.Tensor, processor) -> torch.Tensor:
     """
-    Imposta a -100 (ignore_index) i token della parte di prompt
-    (build_instruction_prompt()) nelle labels, così la loss viene
-    calcolata solo sulla frase target.
+    Robust prompt masking for multimodal Qwen3-VL inputs.
 
-    labels e input_ids hanno shape [B, T] ed inizialmente sono identici.
+    We ignore (set to -100) everything up to and including the instruction part,
+    identified by the substring "Translation:" (tokenized), regardless of extra
+    multimodal tokens inserted by the processor (e.g., <|vision_start|>, <|video_pad|>, etc.).
     """
-    # Ottengo gli ID del prompt (senza special tokens)
-    prompt_text = build_instruction_prompt()
-    prompt_tok = processor.tokenizer(
-        prompt_text,
-        add_special_tokens=False,
-        return_tensors=None,
-    )
-    prompt_ids = prompt_tok["input_ids"] # Ritorna il tensore dalla parte del prompt (solo la parte aggiunta da noi)
-    prompt_len = len(prompt_ids)
-
-    if prompt_len == 0:
-        return labels
-
-    # Lavoro su una copia, per sicurezza
     labels = labels.clone()
     ignore_index = -100
 
-    batch_size, seq_len = labels.shape
+    # Tokenize the *anchor* string that marks the end of the instruction.
+    anchor_text = "Translation:"
+    anchor_ids = processor.tokenizer(
+        anchor_text,
+        add_special_tokens=False,
+        return_tensors=None,
+    )["input_ids"]
 
-    for i in range(batch_size): # Per ogni batch
-        seq = input_ids[i].tolist() # tiro fuori la sequenza di token del prompt del batch i-esimo
+    if len(anchor_ids) == 0:
+        return labels
 
-        # Cerco dove inizia la sottosequenza prompt_ids dentro seq
+    B, T = input_ids.shape
+
+    for b in range(B):
+        seq = input_ids[b].tolist()
+
+        # Find anchor subsequence inside seq
         start_idx = -1
-        max_j = seq_len - prompt_len + 1
-        for j in range(max_j):
-            if seq[j : j + prompt_len] == prompt_ids: # prende una finestra lunga quanto il prompt che inizia in posizione j e la confronto con i token del prompt pre-fatto
-                start_idx = j                         # se matcha so che il prompt inizia lì
+        for j in range(0, T - len(anchor_ids) + 1):
+            if seq[j : j + len(anchor_ids)] == anchor_ids:
+                start_idx = j
                 break
 
         if start_idx == -1:
-            # Non ho trovato esattamente il prompt: in questo caso per sicurezza non maschero nulla.
+            # If we can't find it, do not mask (fallback).
             continue
 
-        end_idx = start_idx + prompt_len
-        # Maschero tutto fino alla fine del prompt
-        labels[i, :end_idx] = ignore_index
+        end_idx = start_idx + len(anchor_ids)
+
+        # Mask everything up to the end of "Translation:" (instruction part)
+        labels[b, :end_idx] = ignore_index
 
     return labels
 
@@ -504,6 +501,10 @@ def evaluate(model, processor, device: str, val_loader, max_batches: int, is_mai
         inputs = {k: v.to(device) for k, v in inputs.items()} # sposto tutti i tensori sulla GPU corretta
         labels = inputs["input_ids"].clone() # clono il tensore dei testi da predirre (in modo da tenerle come label)
         labels = mask_prompt_tokens(labels, inputs["input_ids"], processor)
+        
+        pad_id = processor.tokenizer.pad_token_id
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
 
         outputs = model(**inputs, labels=labels) # Forward
         losses.append(outputs.loss.item()) # memorizzo la loss
@@ -571,7 +572,7 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,                       # non tutti i parametri vengono utilizzati in forward
+            find_unused_parameters=True,                       # non tutti i parametri vengono utilizzati in forward
         )
 
     # GradScaler
@@ -818,6 +819,9 @@ def main():
             inputs = {k: v.to(device) for k, v in inputs.items()} # sposto tutti i tensori sulla GPU corretta
             labels = inputs["input_ids"].clone() # clono il tensore dei testi da predirre (in modo da tenerle come label)
             labels = mask_prompt_tokens(labels, inputs["input_ids"], processor)
+            pad_id = processor.tokenizer.pad_token_id
+            if pad_id is not None:
+                labels[labels == pad_id] = -100
 
             # Attivo autocast (modalità di PyTorch che abilita il mixed precision, FP16 dove è sicuro, FP32 dove serve più precisione)
             if device.startswith("cuda"): # solo su GPU

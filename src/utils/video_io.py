@@ -12,7 +12,6 @@ def extract_frames_from_video(
     video_path: str,
     n_frames_to_take: Optional[int] = None,
     strategy: str = "uniform",
-    seed: Optional[int] = None,
 ) -> List[Image.Image]:
     """
     Extract frames from a video and return them as a list of RGB PIL.Image objects.
@@ -32,13 +31,8 @@ def extract_frames_from_video(
                            roughly take one every 10 frames).
             - "consecutive": take the first `n_frames_to_take` consecutive frames
                             from the beginning of the video.
-            - "center":     take `n_frames_to_take` consecutive frames centered
-                            around the middle of the video.
-            - "random":     pick `n_frames_to_take` random frames (without
-                            replacement). If `seed` is provided, the sampling
-                            is reproducible.
-        seed:
-            Optional random seed used only when strategy="random".
+            - "fps2_max32":   sample frames at approximately 2 fps, with a maximum of
+                            32 frames per video.
 
     Returns:
         List[Image.Image]: list of frames as RGB images in temporal order.
@@ -64,7 +58,7 @@ def extract_frames_from_video(
 
     # Normalize n_frames_to_take: if None or too large, just take everything.
     if n_frames_to_take is None or n_frames_to_take >= n_frames:
-        indices = list(range(n_frames)) # list of indices
+        indices = list(range(n_frames)) # return all frame indices [0, 1, 2, ..., n_frames-1]
     else:
         # Here we implement multiple selection strategies.
         if strategy == "uniform":
@@ -72,26 +66,6 @@ def extract_frames_from_video(
             
         elif strategy == "consecutive":
             indices = list(range(n_frames_to_take)) # Simply take the first `n_frames_to_take` frames: [0, 1, ..., N-1]
-            
-        elif strategy == "center":
-            # Choose a consecutive window of size `n_frames_to_take` centered as much as possible around the middle of the video.
-            center = (n_frames - 1) / 2.0
-            half = (n_frames_to_take - 1) / 2.0
-            start = int(round(center - half))
-            if start < 0:
-                start = 0
-            end = start + n_frames_to_take
-            if end > n_frames:
-                end = n_frames
-                start = end - n_frames_to_take
-                if start < 0:
-                    start = 0
-            indices = list(range(start, end))
-            
-        elif strategy == "random":
-            # Randomly sample `n_frames_to_take` distinct frame indices, using a Generator lets us optionally control reproducibility via `seed`.
-            rng = np.random.default_rng(seed)
-            indices = sorted(rng.choice(n_frames, size=n_frames_to_take, replace=False).tolist())
         
         elif strategy == "fps2_max32":
             # Sample frames at ~2 fps with an upper bound of 32 frames per video.
@@ -136,16 +110,16 @@ def extract_frames_from_video(
 
     # If we executed the fallback above, we pre-loaded all frames into the local variable `frames_raw`. 
     # I check `"frames_raw" in locals()`to know whether that variable exists in the current function scope or not.
-    if "frames_raw" in locals() and frames_raw is not None:
+    if frames_raw is not None:
         # We just index into that list.
         for idx in indices:
             frame = frames_raw[idx]  # numpy array (H, W, 3) - single frame
-            img = Image.fromarray(frame).convert("RGB")
-            frames_pil.append(img)
+            img = Image.fromarray(frame).convert("RGB") # Convert numpy array to PIL image in RGB format
+            frames_pil.append(img) # Append the PIL image to the list
     else:
         # Normal path: we still use the `reader` to fetch specific frames one by one with `get_data(idx)`.
         for idx in indices:
-            frame = reader.get_data(idx)  # numpy array (H, W, 3) - single frame
+            frame = reader.get_data(idx) 
             img = Image.fromarray(frame).convert("RGB")
             frames_pil.append(img)
 

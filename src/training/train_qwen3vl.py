@@ -37,11 +37,11 @@ STAGE = "stage1"  # "stage1" | "stage2"
 DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
-BATCH_SIZE = 1              # poi si prova ad alzare
+BATCH_SIZE = 2              # effettiva
 NUM_EPOCHS = 1              # per ora smoke test
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-GRAD_ACCUM_STEPS = 8        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
+GRAD_ACCUM_STEPS = 16        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
 LOG_EVERY = 50              # step di logging
 MAX_VAL_BATCHES = 50        # quante batch usare in val (per velocità)
 MAX_GEN_TOKENS = 32         # max token generati per valutazione
@@ -457,7 +457,6 @@ def evaluate(model, processor, device: str, val_loader, max_batches: int, is_mai
     """
     Valutazione:
         - val_loss (teacher forcing)
-        - BLEU/ROUGE generando testo dal modello
 
     Per semplicità, valutiamo solo su un sottoinsieme di batch (max_batches).
     """
@@ -600,10 +599,10 @@ def main():
     # )
     
     train_ds = How2SignDataset(             # Costruisco un oggetto Dataset per training
-    json_path=str(DATASET_JSON),
-    split="train",
-    root_dir=str(PROJECT_ROOT),
-    return_type="video",    
+        json_path=str(DATASET_JSON),
+        split="train",
+        root_dir=str(PROJECT_ROOT),
+        return_type="video",    
     )
     val_ds = How2SignDataset(             
         json_path=str(DATASET_JSON),
@@ -830,7 +829,7 @@ def main():
                 autocast_ctx = nullcontext()
 
             with autocast_ctx:
-                outputs = model(**inputs, labels=labels)    # Forward
+                outputs = model(**inputs, labels=labels)    # FORWARD !!!
                 loss = outputs.loss                         # loss
                 # gradient accumulation: faccio media sui GRAD_ACCUM_STEPS
                 loss = loss / GRAD_ACCUM_STEPS              # siccome il “batch effettivo” è più grande di quello che entra in GPU

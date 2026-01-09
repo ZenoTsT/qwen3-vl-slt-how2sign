@@ -1,12 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Evaluation script with robust checkpoint selection logic:
+
+CHECKPOINT POLICY (as requested)
+--------------------------------
+Stage1 checkpoint resolution priority:
+  1) epoch_best
+  2) epoch_latest
+  3) intra_latest
+  else: none
+
+Stage2 checkpoint resolution priority:
+  1) epoch_best
+  2) epoch_latest
+  3) intra_latest
+  else: none
+
+Decision:
+- If Stage1 is ONLY intra_latest (no epoch_best/epoch_latest):
+    -> evaluate using Stage1 intra_latest ONLY
+    -> DO NOT load Stage2 even if present
+- If Stage1 is epoch_best/epoch_latest:
+    - If Stage2 exists (any kind):
+        -> load Stage2 pipeline:
+           (load base) + (attach Stage1 LoRA + load Stage1 adapter) + (MERGE) + (attach Stage2 LoRA) + (load Stage2 adapter)
+    - Else:
+        -> evaluate using Stage1 only (epoch checkpoint)
+
+Also prints extra debug to understand why generation might look "empty".
+"""
+
 import os
 import sys
 import json
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import Optional, Tuple, Dict, Any, List
 
 import torch
 from torch.utils.data import DataLoader
@@ -26,43 +57,37 @@ from src.models.qwen3vl_lora import load_qwen3vl_lora
 
 
 # ---------------------------------------------------------------------
-# HARD-CODED CONFIG (NO PARAMS)
+# HARD-CODED CONFIG
 # ---------------------------------------------------------------------
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
-
-# Always test split (as you requested)
 SPLIT = "test"
-
-# Always stage2 in your current setup; change if needed
-STAGE = "stage2"  # "stage1" or "stage2"
-
-# Max samples for quick debug
 MAX_SAMPLES = 20
 
 # Generation
-MAX_NEW_TOKENS = 48
-DO_SAMPLE = False            # greedy by default (stable)
-TEMPERATURE = 0.7            # used only if DO_SAMPLE=True
-TOP_P = 0.9                  # used only if DO_SAMPLE=True
-REPETITION_PENALTY = 1.2
+MAX_NEW_TOKENS = 64
+DO_SAMPLE = False
+TEMPERATURE = 0.7
+TOP_P = 0.9
+REPETITION_PENALTY = 1.1
 
-# Debug prints
 DEBUG_FIRST_N = 5
 
-# Paths
 DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset_clean.json"
 ROOT_DIR = PROJECT_ROOT
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
-OUT_JSONL = OUTPUT_DIR / "logs" / f"eval_{STAGE}_{SPLIT}_{os.environ.get('SLURM_JOB_ID', 'local')}.jsonl"
+LOGS_DIR = OUTPUT_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+OUT_JSONL = LOGS_DIR / f"eval_auto_{SPLIT}_{os.environ.get('SLURM_JOB_ID', 'local')}.jsonl"
 
-# Stage adapters
-STAGE1_DIR = OUTPUT_DIR / "checkpoints" / "stage1" / "epoch_best"
-STAGE2_DIR = OUTPUT_DIR / "checkpoints" / "stage2" / "intra_latest"
+# Where checkpoints live
+CKPT_ROOT = OUTPUT_DIR / "checkpoints"
+STAGE1_ROOT = CKPT_ROOT / "stage1"
+STAGE2_ROOT = CKPT_ROOT / "stage2"
 
 # Loader
 NUM_WORKERS = 2
-BATCH_SIZE = 1  # fixed; no CLI
+BATCH_SIZE = 1
 
 
 # ---------------------------------------------------------------------
@@ -79,143 +104,33 @@ def build_instruction_prompt() -> str:
 
 
 # ---------------------------------------------------------------------
-# Metrics (NO sacrebleu) -> BLEU1..4 + ROUGE-L
+# Checkpoint resolving
 # ---------------------------------------------------------------------
-def _tokenize(s: str) -> List[str]:
-    return s.strip().split()
+def _ckpt_dir(stage_root: Path, kind: str) -> Path:
+    return stage_root / kind
 
+def resolve_checkpoint(stage_root: Path) -> Tuple[Optional[str], Optional[Path], Optional[Path]]:
+    """
+    Returns: (kind, adapter_path, state_path) using priority:
+      epoch_best > epoch_latest > intra_latest
+    """
+    priority = ["epoch_best", "epoch_latest", "intra_latest"]
+    for kind in priority:
+        d = _ckpt_dir(stage_root, kind)
+        a = d / "adapter.pt"
+        s = d / "state.pt"
+        if a.exists() and s.exists():
+            return kind, a, s
+    return None, None, None
 
-def _ngram_counts(tokens: List[str], n: int) -> Dict[Tuple[str, ...], int]:
-    counts: Dict[Tuple[str, ...], int] = {}
-    if n <= 0:
-        return counts
-    for i in range(len(tokens) - n + 1):
-        ng = tuple(tokens[i : i + n])
-        counts[ng] = counts.get(ng, 0) + 1
-    return counts
+def resolve_checkpoint_dir(stage_root: Path, kind: str) -> Path:
+    return _ckpt_dir(stage_root, kind)
 
-
-def _modified_precision(candidate: List[str], references: List[List[str]], n: int) -> Tuple[int, int]:
-    cand_counts = _ngram_counts(candidate, n)
-    if not cand_counts:
-        return (0, 0)
-
-    max_ref_counts: Dict[Tuple[str, ...], int] = {}
-    for ref in references:
-        ref_counts = _ngram_counts(ref, n)
-        for ng, c in ref_counts.items():
-            prev = max_ref_counts.get(ng, 0)
-            if c > prev:
-                max_ref_counts[ng] = c
-
-    clipped = 0
-    total = 0
-    for ng, c in cand_counts.items():
-        clipped += min(c, max_ref_counts.get(ng, 0))
-        total += c
-    return clipped, total
-
-
-def _closest_ref_length(cand_len: int, ref_lens: List[int]) -> int:
-    best = ref_lens[0]
-    best_dist = abs(best - cand_len)
-    for rl in ref_lens[1:]:
-        dist = abs(rl - cand_len)
-        if dist < best_dist or (dist == best_dist and rl < best):
-            best = rl
-            best_dist = dist
-    return best
-
-
-def corpus_bleu_n(preds: List[str], refs: List[str], n: int, smoothing_eps: float = 1e-9) -> float:
-    assert len(preds) == len(refs)
-    if len(preds) == 0:
-        return float("nan")
-
-    import math
-
-    p_num = [0] * n
-    p_den = [0] * n
-    cand_len_sum = 0
-    ref_len_sum = 0
-
-    for pred, ref in zip(preds, refs):
-        cand_tok = _tokenize(pred)
-        ref_tok = _tokenize(ref)
-
-        cand_len_sum += len(cand_tok)
-        ref_len_sum += _closest_ref_length(len(cand_tok), [len(ref_tok)])
-
-        for k in range(1, n + 1):
-            cm, tot = _modified_precision(cand_tok, [ref_tok], k)
-            p_num[k - 1] += cm
-            p_den[k - 1] += tot
-
-    if cand_len_sum == 0:
-        return 0.0
-
-    log_p_sum = 0.0
-    for k in range(n):
-        if p_den[k] == 0:
-            p = smoothing_eps
-        else:
-            p = p_num[k] / p_den[k]
-            if p == 0.0:
-                p = smoothing_eps
-        log_p_sum += math.log(p)
-
-    geo_mean = math.exp(log_p_sum / n)
-
-    if cand_len_sum > ref_len_sum:
-        bp = 1.0
-    else:
-        bp = math.exp(1.0 - (ref_len_sum / max(cand_len_sum, 1)))
-
-    return float(bp * geo_mean)
-
-
-def _lcs_length(a: List[str], b: List[str]) -> int:
-    la, lb = len(a), len(b)
-    if la == 0 or lb == 0:
-        return 0
-    dp = [0] * (lb + 1)
-    for i in range(1, la + 1):
-        prev = 0
-        for j in range(1, lb + 1):
-            tmp = dp[j]
-            if a[i - 1] == b[j - 1]:
-                dp[j] = prev + 1
-            else:
-                dp[j] = max(dp[j], dp[j - 1])
-            prev = tmp
-    return dp[lb]
-
-
-def corpus_rouge_l(preds: List[str], refs: List[str]) -> float:
-    assert len(preds) == len(refs)
-    if len(preds) == 0:
-        return float("nan")
-
-    f1s = []
-    for pred, ref in zip(preds, refs):
-        p_tok = _tokenize(pred)
-        r_tok = _tokenize(ref)
-        if len(p_tok) == 0 or len(r_tok) == 0:
-            f1s.append(0.0)
-            continue
-        lcs = _lcs_length(p_tok, r_tok)
-        prec = lcs / len(p_tok)
-        rec = lcs / len(r_tok)
-        f1 = 0.0 if (prec + rec) == 0 else (2 * prec * rec) / (prec + rec)
-        f1s.append(f1)
-
-    return float(sum(f1s) / len(f1s))
-
-
-# ---------------------------------------------------------------------
-# Adapter loading (only lora_ keys)
-# ---------------------------------------------------------------------
 def load_adapter_into_model_only_lora(model, adapter_path: Path, device: str) -> Tuple[int, int]:
+    """
+    Loads only LoRA weights from adapter.pt into an already PEFT-instrumented model.
+    Returns (missing_lora_keys, unexpected_keys).
+    """
     adapter_state = torch.load(adapter_path, map_location="cpu")
 
     model_to_load = model.module if hasattr(model, "module") else model
@@ -238,29 +153,144 @@ def load_adapter_into_model_only_lora(model, adapter_path: Path, device: str) ->
 
 
 # ---------------------------------------------------------------------
-# Generation (MATCHES TRAINING SETUP)
+# Model loading policy
+# ---------------------------------------------------------------------
+def build_model_with_correct_adapters(device: str):
+    """
+    Implements the requested policy:
+    - stage1 intra only -> stage1 only
+    - stage1 epoch + stage2 exists -> merge stage1 then stage2 adapter
+    - stage1 epoch only -> stage1 only
+    - stage1 missing -> if stage2 exists, stage2 standalone (fallback)
+    """
+    s1_kind, s1_adapter, s1_state = resolve_checkpoint(STAGE1_ROOT)
+    s2_kind, s2_adapter, s2_state = resolve_checkpoint(STAGE2_ROOT)
+
+    # Additionally: detect "stage1 is only intra" case explicitly
+    s1_has_epoch_best = (resolve_checkpoint_dir(STAGE1_ROOT, "epoch_best") / "adapter.pt").exists()
+    s1_has_epoch_latest = (resolve_checkpoint_dir(STAGE1_ROOT, "epoch_latest") / "adapter.pt").exists()
+    s1_has_epoch = s1_has_epoch_best or s1_has_epoch_latest
+    s1_has_intra = (resolve_checkpoint_dir(STAGE1_ROOT, "intra_latest") / "adapter.pt").exists()
+
+    # Compute "stage1 only intra" (no epoch checkpoint but intra exists)
+    s1_only_intra = (not s1_has_epoch) and s1_has_intra
+
+    print("============================================================")
+    print("[CKPT RESOLVE]")
+    print(f"  Stage1 resolved kind: {s1_kind} | adapter: {s1_adapter}")
+    print(f"  Stage2 resolved kind: {s2_kind} | adapter: {s2_adapter}")
+    print(f"  Stage1 has_epoch? {s1_has_epoch} | has_intra? {s1_has_intra} | only_intra? {s1_only_intra}")
+    print("============================================================\n")
+
+    # -----------------------
+    # CASE A: Stage1 only intra -> evaluate Stage1 only (ignore Stage2)
+    # -----------------------
+    if s1_only_intra:
+        print("[POLICY] Stage1 has ONLY intra_latest -> evaluate with Stage1 intra_latest ONLY. Stage2 will be ignored.\n")
+        model, processor = load_qwen3vl_lora(
+            model_name=MODEL_NAME,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
+            stage="stage1",
+        )
+        # load stage1 intra adapter
+        s1_intra_adapter = resolve_checkpoint_dir(STAGE1_ROOT, "intra_latest") / "adapter.pt"
+        missing, unexpected = load_adapter_into_model_only_lora(model, s1_intra_adapter, device=device)
+        print(f"[LOAD] Stage1 intra_latest adapter loaded. missing={missing}, unexpected={unexpected}\n")
+        return model, processor, {"mode": "stage1_only_intra", "stage1_kind": "intra_latest", "stage2_kind": None}
+
+    # -----------------------
+    # CASE B: Stage1 epoch exists
+    #   - if Stage2 exists -> merge stage1 then stage2 adapter
+    #   - else -> stage1 only
+    # -----------------------
+    if s1_has_epoch:
+        # pick which epoch dir to use for stage1 merging/loading
+        s1_epoch_dir = None
+        if s1_has_epoch_best:
+            s1_epoch_dir = resolve_checkpoint_dir(STAGE1_ROOT, "epoch_best")
+            s1_epoch_kind = "epoch_best"
+        else:
+            s1_epoch_dir = resolve_checkpoint_dir(STAGE1_ROOT, "epoch_latest")
+            s1_epoch_kind = "epoch_latest"
+
+        if s2_kind is not None and s2_adapter is not None:
+            print("[POLICY] Stage1 has epoch checkpoint AND Stage2 exists -> merge Stage1 into base, then attach Stage2 and load Stage2 adapter.\n")
+            model, processor = load_qwen3vl_lora(
+                model_name=MODEL_NAME,
+                r=16, alpha=32, dropout=0.05,
+                device=device,
+                stage="stage2",
+                stage1_adapter_dir=str(s1_epoch_dir),
+            )
+            # Now load stage2 adapter weights into the stage2 PEFT model
+            missing, unexpected = load_adapter_into_model_only_lora(model, s2_adapter, device=device)
+            print(f"[LOAD] Stage2 adapter loaded ({s2_kind}). missing={missing}, unexpected={unexpected}\n")
+            return model, processor, {"mode": "stage1_merge_stage2", "stage1_kind": s1_epoch_kind, "stage2_kind": s2_kind}
+
+        print("[POLICY] Stage1 has epoch checkpoint but Stage2 not found -> evaluate Stage1 only.\n")
+        model, processor = load_qwen3vl_lora(
+            model_name=MODEL_NAME,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
+            stage="stage1",
+        )
+        # load stage1 epoch adapter into stage1 PEFT model
+        s1_epoch_adapter = s1_epoch_dir / "adapter.pt"
+        missing, unexpected = load_adapter_into_model_only_lora(model, s1_epoch_adapter, device=device)
+        print(f"[LOAD] Stage1 epoch adapter loaded ({s1_epoch_kind}). missing={missing}, unexpected={unexpected}\n")
+        return model, processor, {"mode": "stage1_only_epoch", "stage1_kind": s1_epoch_kind, "stage2_kind": None}
+
+    # -----------------------
+    # CASE C: No Stage1 checkpoint at all
+    #   - if Stage2 exists -> stage2 standalone (fallback)
+    #   - else -> base model only
+    # -----------------------
+    if s2_kind is not None and s2_adapter is not None:
+        print("[POLICY] No Stage1 checkpoint found, but Stage2 exists -> evaluating Stage2 standalone (fallback).\n")
+        model, processor = load_qwen3vl_lora(
+            model_name=MODEL_NAME,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
+            stage="stage2",
+            stage1_adapter_dir=None,
+        )
+        missing, unexpected = load_adapter_into_model_only_lora(model, s2_adapter, device=device)
+        print(f"[LOAD] Stage2 adapter loaded ({s2_kind}). missing={missing}, unexpected={unexpected}\n")
+        return model, processor, {"mode": "stage2_standalone", "stage1_kind": None, "stage2_kind": s2_kind}
+
+    print("[POLICY] No Stage1/Stage2 checkpoints found -> evaluating base model only.\n")
+    model, processor = load_qwen3vl_lora(
+        model_name=MODEL_NAME,
+        r=16, alpha=32, dropout=0.05,
+        device=device,
+        stage="stage1",  # stage doesn't matter too much; but this attaches LoRA modules. If you want truly base-only, you'd load the HF model directly.
+    )
+    return model, processor, {"mode": "no_ckpt_found", "stage1_kind": None, "stage2_kind": None}
+
+
+# ---------------------------------------------------------------------
+# Generation
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[str, Any]:
-    OUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
-
-    preds: List[str] = []
-    refs: List[str] = []
-
     model.eval()
 
     eos_id = getattr(getattr(processor, "tokenizer", None), "eos_token_id", None)
+    pad_id = getattr(getattr(processor, "tokenizer", None), "pad_token_id", None)
+
+    preds: List[str] = []
+    refs: List[str] = []
+    raws: List[str] = []
 
     n_done = 0
     t0 = time.time()
 
+    use_autocast = device.startswith("cuda")
+    autocast_ctx = torch.amp.autocast("cuda") if use_autocast else nullcontext()
+
     with OUT_JSONL.open("w", encoding="utf-8") as f:
-        pbar = tqdm(
-            loader,
-            total=min(MAX_SAMPLES, len(loader.dataset)),
-            desc="Evaluating",
-            dynamic_ncols=True,
-        )
+        pbar = tqdm(loader, total=min(MAX_SAMPLES, len(loader.dataset)), desc="Evaluating", dynamic_ncols=True)
 
         for batch_idx, batch in enumerate(pbar):
             if n_done >= MAX_SAMPLES:
@@ -269,39 +299,30 @@ def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[st
             videos_batch: List[str] = batch["videos"]
             texts_batch: List[str] = batch["texts"]
 
-            # ============================================================
-            # PROMPT — IDENTICAL TO TRAINING
-            # ============================================================
             prompt = build_instruction_prompt()
             prompts = [prompt] * len(videos_batch)
 
             inputs = processor(
-                videos=videos_batch,     # <-- VIDEO PASSATO QUI
-                text=prompts,            # <-- TESTO CON <|video_pad|>
+                videos=videos_batch,
+                text=prompts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                # num_frames=32,          # opzionale, per debug
-                # fps=2.0,
             )
 
-            # DEBUG: processor output (solo primo batch)
+            # Debug processor output once
             if batch_idx == 0:
                 print("\n================ DEBUG: PROCESSOR OUTPUT (BATCH 0) ================")
                 print("processor keys:", list(inputs.keys()))
                 for k, v in inputs.items():
-                    if hasattr(v, "shape"):
-                        print(f"  {k}: shape={tuple(v.shape)} dtype={getattr(v,'dtype',None)}")
+                    if torch.is_tensor(v):
+                        print(f"  {k}: shape={tuple(v.shape)} dtype={v.dtype} device={v.device}")
                 print("===================================================================\n")
 
+            # Move tensors
             inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+            input_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else None
 
-            if batch_idx == 0:
-                print(f"[DEBUG] pixel_values_videos present? {'pixel_values_videos' in inputs}")
-
-            # ============================================================
-            # GENERATION
-            # ============================================================
             gen_kwargs = dict(
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=DO_SAMPLE,
@@ -311,92 +332,86 @@ def run_generation(model, processor, device: str, loader: DataLoader) -> Dict[st
                 gen_kwargs.update(dict(temperature=TEMPERATURE, top_p=TOP_P))
             if eos_id is not None:
                 gen_kwargs["eos_token_id"] = eos_id
+            if pad_id is not None:
+                gen_kwargs["pad_token_id"] = pad_id
 
-            generated_ids = model.generate(**inputs, **gen_kwargs)
-            decoded = processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            with autocast_ctx:
+                generated_ids = model.generate(**inputs, **gen_kwargs)
 
-            # ============================================================
-            # CLEAN OUTPUT (keep only translation)
-            # ============================================================
+            # RAW decode (keep specials for debugging)
+            decoded_raw = processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
+            decoded_clean = processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
             cleaned: List[str] = []
-            for s in decoded:
+            for s in decoded_clean:
                 s2 = s.strip()
                 if "Translation:" in s2:
                     s2 = s2.split("Translation:", 1)[-1].strip()
                 cleaned.append(s2)
 
-            # ============================================================
-            # SAVE
-            # ============================================================
-            for vp, ref, pred in zip(videos_batch, texts_batch, cleaned):
+            # Extra debug: did we actually generate new tokens?
+            new_tok_lens = []
+            if input_len is not None:
+                for i in range(generated_ids.shape[0]):
+                    new_tok_lens.append(int(generated_ids[i].shape[0] - input_len))
+
+            for vp, ref, pred, raw in zip(videos_batch, texts_batch, cleaned, decoded_raw):
                 preds.append(pred)
                 refs.append(ref)
-                f.write(json.dumps(
-                    {"video_path": vp, "ref": ref, "pred": pred},
-                    ensure_ascii=False
-                ) + "\n")
+                raws.append(raw)
+
+                payload = {
+                    "video_path": vp,
+                    "ref": ref,
+                    "pred": pred,
+                    "raw": raw,
+                    "input_len": input_len,
+                    "total_len": int(generated_ids.shape[1]) if generated_ids.ndim == 2 else None,
+                    "new_tokens": (new_tok_lens[0] if len(new_tok_lens) else None),
+                }
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
                 n_done += 1
 
                 if n_done <= DEBUG_FIRST_N:
                     print("\n---------------- SAMPLE DEBUG ----------------")
                     print("VIDEO:", vp)
                     print("REF :", ref)
-                    print("PRED:", pred)
+                    print("PRED(cleaned):", repr(pred))
+                    if input_len is not None:
+                        print(f"LEN: input={input_len} total={generated_ids.shape[1]} new={new_tok_lens[0]}")
+                    # show tail of raw to see what happens after Translation:
+                    tail = raw[-400:] if len(raw) > 400 else raw
+                    print("RAW tail:", tail.replace("\n", "\\n"))
                     print("---------------------------------------------\n")
-
-                if n_done >= MAX_SAMPLES:
-                    break
 
             pbar.set_postfix({"done": n_done})
 
     dt = time.time() - t0
-    return {"n_samples": n_done, "seconds": dt, "preds": preds, "refs": refs}
+    return {"n_samples": n_done, "seconds": dt, "preds": preds, "refs": refs, "raws": raws}
+
+
+# small helper for autocast on CPU
+from contextlib import nullcontext
 
 
 def main():
-    # IMPORTANT: ignore any CLI args to avoid failures from extra flags in wrappers
-    # (we just don't parse them at all)
-
-    print("[INFO] Running eval (NO PARAMS):")
-    print(f"  stage      = {STAGE}")
-    print(f"  split      = {SPLIT}")
-    print(f"  max_samples= {MAX_SAMPLES}")
-    print(f"  stage1_dir = {STAGE1_DIR}")
-    print(f"  stage2_dir = {STAGE2_DIR}")
-    print(f"  out_jsonl  = {OUT_JSONL}")
+    print("[INFO] Eval script with auto checkpoint logic")
+    print(f"[INFO] PROJECT_ROOT = {PROJECT_ROOT}")
+    print(f"[INFO] DATASET_JSON  = {DATASET_JSON}")
+    print(f"[INFO] OUT_JSONL     = {OUT_JSONL}")
+    print(f"[INFO] CKPT_ROOT     = {CKPT_ROOT}\n")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[INFO] device={device}")
+    print(f"[INFO] device={device}\n")
 
-    # Load model + processor
+    # Load model+processor according to policy
     t0 = time.time()
-    if STAGE == "stage1":
-        model, processor = load_qwen3vl_lora(
-            model_name=MODEL_NAME,
-            r=16, alpha=32, dropout=0.05,
-            device=device,
-            stage="stage1",
-        )
-    else:
-        model, processor = load_qwen3vl_lora(
-            model_name=MODEL_NAME,
-            r=16, alpha=32, dropout=0.05,
-            device=device,
-            stage="stage2",
-            stage1_adapter_dir=str(STAGE1_DIR),
-        )
-    print(f"[TIMER] load_qwen3vl_lora() time: {time.time() - t0:.2f}s")
+    model, processor, policy = build_model_with_correct_adapters(device=device)
+    print(f"[TIMER] model+processor ready in {time.time() - t0:.2f}s")
+    print(f"[INFO] policy: {policy}\n")
 
-    # Load stage2 adapter (only lora_ weights)
-    if STAGE2_DIR is not None:
-        adapter_path = Path(STAGE2_DIR) / "adapter.pt"
-        if adapter_path.exists():
-            missing, unexpected = load_adapter_into_model_only_lora(model, adapter_path, device=device)
-            print(f"[CKPT] Stage2 adapter loaded: missing={missing}, unexpected={unexpected}")
-        else:
-            print(f"[WARN] Stage2 adapter not found at: {adapter_path} (continuing without stage2 adapter)")
-
-    # Dataset (forced test)
+    # Dataset
     ds = How2SignDataset(
         json_path=str(DATASET_JSON),
         split=SPLIT,
@@ -405,7 +420,7 @@ def main():
     )
     print(f"[How2SignDataset] split={SPLIT} | num_samples={len(ds)}")
     print(f"[How2SignDataset] json_path={DATASET_JSON}")
-    print(f"[How2SignDataset] root_dir={ROOT_DIR}")
+    print(f"[How2SignDataset] root_dir={ROOT_DIR}\n")
 
     loader = DataLoader(
         ds,
@@ -416,44 +431,18 @@ def main():
         pin_memory=(device == "cuda"),
     )
 
-    # Generate
     gen = run_generation(model, processor, device=device, loader=loader)
-    print(f"[INFO] Generation done in {gen['seconds']:.1f}s for {gen['n_samples']} samples.")
-    print(f"[INFO] Saved predictions to: {OUT_JSONL}")
+    print(f"\n[INFO] Generation done in {gen['seconds']:.1f}s for {gen['n_samples']} samples.")
+    print(f"[INFO] Saved predictions to: {OUT_JSONL}\n")
 
-    preds = gen["preds"]
-    refs = gen["refs"]
-
-    # Metrics
-    bleu1 = corpus_bleu_n(preds, refs, n=1)
-    bleu2 = corpus_bleu_n(preds, refs, n=2)
-    bleu3 = corpus_bleu_n(preds, refs, n=3)
-    bleu4 = corpus_bleu_n(preds, refs, n=4)
-    rouge_l = corpus_rouge_l(preds, refs)
-
-    metrics = {
-        "split": SPLIT,
-        "stage": STAGE,
-        "n_samples": gen["n_samples"],
-        "BLEU1": bleu1,
-        "BLEU2": bleu2,
-        "BLEU3": bleu3,
-        "BLEU4": bleu4,
-        "ROUGE_L_F1": rouge_l,
-    }
-
-    print("\n================ METRICS ================")
-    for k, v in metrics.items():
-        if isinstance(v, float):
-            print(f"{k:>12}: {v:.6f}")
-        else:
-            print(f"{k:>12}: {v}")
-    print("=========================================\n")
-
-    metrics_path = OUT_JSONL.with_suffix(".metrics.json")
-    with metrics_path.open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
-    print(f"[INFO] Saved metrics to: {metrics_path}")
+    # quick sanity summary
+    num_empty = sum(1 for p in gen["preds"] if (p.strip() == ""))
+    print("=============== QUICK SANITY ===============")
+    print(f"mode            : {policy['mode']}")
+    print(f"stage1_kind      : {policy.get('stage1_kind')}")
+    print(f"stage2_kind      : {policy.get('stage2_kind')}")
+    print(f"empty_clean_preds: {num_empty}/{len(gen['preds'])}")
+    print("===========================================\n")
 
 
 if __name__ == "__main__":

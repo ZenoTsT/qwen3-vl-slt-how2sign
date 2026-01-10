@@ -6,20 +6,22 @@ src/training/train_qwen3vl_singlestage.py
 Single-stage LoRA training for Qwen3-VL on How2Sign (video->text).
 - DDP ready (torchrun)
 - OVERFIT_TEST supported (train on a fixed small subset)
-- Train/Evaluate
+- Train/Evaluate (+ optional generation debug on rank0)
 
 Launch:
-  torchrun --nproc_per_node=4 src/training/train_qwen3vl_singlestage.py
+  torchrun --nproc_per_node=2 src/training/train_qwen3vl_singlestage.py
 """
 
 import os
 import sys
-import json
 import time
 import random
 from pathlib import Path
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
+
+# --- avoid tokenizers fork deadlocks/warnings ---
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 import torch.distributed as dist
@@ -27,21 +29,24 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torch import amp
 from tqdm import tqdm
 
+
 # ---------------------------------------------------------------------
 # PYTHONPATH: add repo root
 # ---------------------------------------------------------------------
 THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent.parent
-
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from src.datasets.how2sign_loader import How2SignDataset, how2sign_collate_fn
+
+# >>> IMPORTANT: make this import match your actual model loader filename <<<
+# You pasted src/models/qwen3vl_lora_full.py, so we import from that:
 from src.models.qwen3vl_lora_singlestage import load_qwen3vl_full_lora
 
 
 # =====================================================================
-# CONFIG 
+# CONFIG
 # =====================================================================
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
 
@@ -51,12 +56,13 @@ OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign_singlestage"
 NUM_EPOCHS = 10
 BATCH_SIZE = 1
 NUM_WORKERS = 4
+
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 GRAD_ACCUM_STEPS = 16
 MAX_STEPS: Optional[int] = None
 
-# Validation
+# Validation (rank0 only)
 MAX_VAL_BATCHES = 50
 
 # Generation debug (rank0 only)
@@ -78,6 +84,10 @@ LOG_EVERY = 20
 # DDP helpers
 # =====================================================================
 def setup_ddp() -> Dict[str, Any]:
+    """
+    Returns:
+      rank, world_size, local_rank, device, is_main
+    """
     if not torch.cuda.is_available():
         return dict(rank=0, world_size=1, local_rank=0, device="cpu", is_main=True)
 
@@ -89,8 +99,15 @@ def setup_ddp() -> Dict[str, Any]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     rank = int(os.environ.get("RANK", "0"))
     torch.cuda.set_device(local_rank)
+
     dist.init_process_group(backend="nccl")
-    return dict(rank=rank, world_size=world_size, local_rank=local_rank, device=f"cuda:{local_rank}", is_main=(rank == 0))
+    return dict(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=f"cuda:{local_rank}",
+        is_main=(rank == 0),
+    )
 
 
 def cleanup_ddp() -> None:
@@ -98,29 +115,54 @@ def cleanup_ddp() -> None:
         dist.destroy_process_group()
 
 
+def ddp_barrier(ddp: Dict[str, Any]) -> None:
+    if ddp["world_size"] > 1 and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
 # =====================================================================
-# Prompt + masking 
+# Prompt + masking
 # =====================================================================
-SYSTEM_PROMPT = "You are a helpful assistant."
+SYSTEM_PROMPT = "You are a sign language translation model."
 USER_INSTRUCTION = (
     "Translate the sign language video into English.\n\n"
     "Answer with the English sentence only.\n\n"
     "Translation:"
 )
 
+ANCHOR_TEXT = "Translation:"  # used to find the boundary inside input_ids
+
 
 def build_messages(video_path: str, target_text: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Multimodal chat:
+      system: text
+      user:   [video + instruction text]
+      assistant (optional): target text
+    """
     user_content = [
         {"type": "video", "video": video_path},
         {"type": "text", "text": USER_INSTRUCTION},
     ]
-    messages = [
+    msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
     if target_text is not None:
-        messages.append({"role": "assistant", "content": [{"type": "text", "text": target_text}]})
-    return messages
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": target_text}]})
+    return msgs
+
+
+def _apply_chat_template(processor, messages, add_generation_prompt: bool) -> str:
+    """
+    Compat layer:
+    - some processors expose apply_chat_template
+    - otherwise use tokenizer.apply_chat_template
+    """
+    if hasattr(processor, "apply_chat_template"):
+        return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+    return processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+
 
 def make_batch_inputs_and_labels(
     processor,
@@ -129,18 +171,16 @@ def make_batch_inputs_and_labels(
     device: str,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     """
-    Chat-template SFT (robust masking):
-    - Costruisce full_text (prompt + assistant target) con apply_chat_template
-    - Tokenizza con processor (che inserisce i token video)
-    - Maschera tutto fino all'anchor "Translation:" (incluso), trovandolo DENTRO input_ids
-      così non dipendiamo da prompt_len che NON include i token video aggiunti dal processor.
+    Robust SFT masking for multimodal:
+    - build full_text (prompt + assistant target) via chat template
+    - encode with processor(videos=..., text=...)
+    - locate anchor "Translation:" inside input_ids (this includes video tokens inserted by processor)
+    - mask labels up to (and including) the anchor
     """
     full_texts: List[str] = []
-
     for vp, tgt in zip(videos_batch, texts_batch):
         msg_full = build_messages(vp, target_text=tgt)
-        ftxt = processor.apply_chat_template(msg_full, tokenize=False, add_generation_prompt=False)
-        full_texts.append(ftxt)
+        full_texts.append(_apply_chat_template(processor, msg_full, add_generation_prompt=False))
 
     full_inputs = processor(
         videos=videos_batch,
@@ -153,13 +193,11 @@ def make_batch_inputs_and_labels(
 
     input_ids = full_inputs["input_ids"]
     labels = input_ids.clone()
-
     ignore_index = -100
 
-    # Anchor: fine istruzione -> inizio risposta
-    anchor_text = "Translation:"
+    # tokenize anchor once
     anchor_ids = processor.tokenizer(
-        anchor_text,
+        ANCHOR_TEXT,
         add_special_tokens=False,
         return_tensors=None,
     )["input_ids"]
@@ -175,13 +213,13 @@ def make_batch_inputs_and_labels(
                 break
 
         if start_idx == -1:
-            # fallback conservative: non mascherare nulla (meglio che mascherare tutto)
+            # conservative fallback: don't mask anything (better than masking everything)
             continue
 
         end_idx = start_idx + len(anchor_ids)
         labels[b, :end_idx] = ignore_index
 
-    # Pad masking
+    # mask pads
     pad_id = processor.tokenizer.pad_token_id
     if pad_id is not None:
         labels[labels == pad_id] = ignore_index
@@ -189,6 +227,9 @@ def make_batch_inputs_and_labels(
     return full_inputs, labels
 
 
+# =====================================================================
+# Generation debug (rank0 only)
+# =====================================================================
 @torch.no_grad()
 def generate_translations(
     model,
@@ -196,11 +237,14 @@ def generate_translations(
     device: str,
     videos: List[str],
 ) -> List[str]:
+    # IMPORTANT: unwrap DDP for generation
+    m = model.module if hasattr(model, "module") else model
+    m.eval()
+
     prompts: List[str] = []
     for vp in videos:
         msg_prompt = build_messages(vp, target_text=None)
-        ptxt = processor.apply_chat_template(msg_prompt, tokenize=False, add_generation_prompt=True)
-        prompts.append(ptxt)
+        prompts.append(_apply_chat_template(processor, msg_prompt, add_generation_prompt=True))
 
     inputs = processor(
         videos=videos,
@@ -211,17 +255,22 @@ def generate_translations(
     )
     inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-    gen_ids = model.generate(
+    # generate
+    gen_ids = m.generate(
         **inputs,
         max_new_tokens=GEN_MAX_NEW_TOKENS,
         do_sample=False,
     )
-    decoded = processor.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
+    # decode ONLY generated continuation (avoid echoing prompt)
+    in_len = inputs["input_ids"].shape[1]
+    gen_only = gen_ids[:, in_len:] if gen_ids.shape[1] > in_len else gen_ids
+    decoded = processor.tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
+    # light cleanup
     cleaned: List[str] = []
     for s in decoded:
         s2 = s.strip()
-        # heuristic: keep last non-empty line
         if "\n" in s2:
             parts = [p.strip() for p in s2.split("\n") if p.strip()]
             if parts:
@@ -231,7 +280,7 @@ def generate_translations(
 
 
 # =====================================================================
-# Eval
+# Eval (rank0 only)
 # =====================================================================
 @torch.no_grad()
 def evaluate_loss(
@@ -283,8 +332,8 @@ def evaluate_generation_debug(
 
         videos_batch: List[str] = batch["videos"]
         texts_batch: List[str] = batch["texts"]
-        preds = generate_translations(model, processor, device, videos_batch)
 
+        preds = generate_translations(model, processor, device, videos_batch)
         for ref, pred in zip(texts_batch, preds):
             print("----- GEN DEBUG -----")
             print("REF :", ref)
@@ -329,7 +378,6 @@ def train_loop(
     )
 
     scaler = amp.GradScaler("cuda") if device.startswith("cuda") else None
-
     global_step = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -339,10 +387,7 @@ def train_loop(
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        data_iter = train_loader
-        if is_main:
-            data_iter = tqdm(train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True)
-
+        data_iter = tqdm(train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else train_loader
         running_loss = 0.0
 
         for step_in_epoch, batch in enumerate(data_iter, start=1):
@@ -389,13 +434,16 @@ def train_loop(
                     print(f"[INFO] Reached MAX_STEPS={MAX_STEPS} -> stopping.")
                 break
 
-        # ---- EVAL (rank0 only) ----
+        # ---- EVAL/GENDebug only on rank0 ----
         if is_main:
             ev = evaluate_loss(model, processor, device, val_loader, MAX_VAL_BATCHES, ddp)
             print(f"[EVAL] epoch={epoch} val_loss={ev.get('loss', float('nan')):.4f}")
 
             if DO_GENERATION_EVAL and GEN_EVERY_EPOCH:
                 evaluate_generation_debug(model, processor, device, val_loader, max_batches=MAX_VAL_BATCHES, ddp=ddp)
+
+        # IMPORTANT: keep ranks in sync (avoid NCCL timeouts if rank0 does extra work)
+        ddp_barrier(ddp)
 
         if MAX_STEPS is not None and global_step >= MAX_STEPS:
             break
@@ -409,6 +457,13 @@ def train_loop(
 # =====================================================================
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # best-effort: safer multiprocessing
+    try:
+        import torch.multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
 
     ddp = setup_ddp()
     is_main = ddp["is_main"]
@@ -426,90 +481,97 @@ def main():
         print(f"[INFO] OVERFIT_TEST = {OVERFIT_TEST} (n={OVERFIT_N_SAMPLES})")
         print("==============================================\n")
 
-    # 1) Load model + processor
-    t0 = time.time()
-    model, processor = load_qwen3vl_full_lora(
-        model_name=MODEL_NAME,
-        r=16,
-        alpha=32,
-        dropout=0.05,
-        device=device,
-        target_modules="all-linear",
-    )
-    if is_main:
-        print(f"[TIMER] model+processor loaded in {time.time() - t0:.2f}s")
-
-    # 2) DDP wrap
-    if ddp["world_size"] > 1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[ddp["local_rank"]],
-            output_device=ddp["local_rank"],
-            find_unused_parameters=True,
+    # ---- EVERYTHING in try/finally so we always cleanup DDP ----
+    try:
+        # 1) Load model + processor (per-rank device)
+        t0 = time.time()
+        model, processor = load_qwen3vl_full_lora(
+            model_name=MODEL_NAME,
+            r=16,
+            alpha=32,
+            dropout=0.05,
+            device=device,
         )
+        if is_main:
+            print(f"[TIMER] model+processor loaded in {time.time() - t0:.2f}s")
 
-    # 3) Dataset
-    train_ds_full = How2SignDataset(
-        json_path=str(DATASET_JSON),
-        split="train",
-        root_dir=str(PROJECT_ROOT),
-        return_type="video",
-    )
+        # 2) DDP wrap
+        if ddp["world_size"] > 1:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[ddp["local_rank"]],
+                output_device=ddp["local_rank"],
+                find_unused_parameters=False,  # you saw the warning -> turn it off
+            )
 
-    if OVERFIT_TEST:
-        train_ds = make_overfit_subset(train_ds_full, OVERFIT_N_SAMPLES, OVERFIT_SEED)
-        val_ds = train_ds  # evaluate on the same subset (best signal)
-    else:
-        train_ds = train_ds_full
-        val_ds = How2SignDataset(
+        # 3) Dataset
+        train_ds_full = How2SignDataset(
             json_path=str(DATASET_JSON),
-            split="val",
+            split="train",
             root_dir=str(PROJECT_ROOT),
             return_type="video",
         )
 
-    if is_main:
-        print(f"[DATA] train={len(train_ds)} | val={len(val_ds)}")
+        if OVERFIT_TEST:
+            train_ds = make_overfit_subset(train_ds_full, OVERFIT_N_SAMPLES, OVERFIT_SEED)
+            val_ds = train_ds
+        else:
+            train_ds = train_ds_full
+            val_ds = How2SignDataset(
+                json_path=str(DATASET_JSON),
+                split="val",
+                root_dir=str(PROJECT_ROOT),
+                return_type="video",
+            )
 
-    # 4) Loaders
-    if ddp["world_size"] > 1:
-        train_sampler = DistributedSampler(train_ds, num_replicas=ddp["world_size"], rank=ddp["rank"], shuffle=True)
-        shuffle_flag = False
-    else:
-        train_sampler = None
-        shuffle_flag = True
+        if is_main:
+            print(f"[DATA] train={len(train_ds)} | val={len(val_ds)}")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=shuffle_flag,
-        sampler=train_sampler,
-        num_workers=NUM_WORKERS,
-        collate_fn=how2sign_collate_fn,
-        pin_memory=device.startswith("cuda"),
-    )
+        # 4) Loaders
+        if ddp["world_size"] > 1:
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=ddp["world_size"],
+                rank=ddp["rank"],
+                shuffle=True,
+            )
+            shuffle_flag = False
+        else:
+            train_sampler = None
+            shuffle_flag = True
 
-    # rank0 eval only -> no sampler needed
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=max(1, NUM_WORKERS // 2),
-        collate_fn=how2sign_collate_fn,
-        pin_memory=device.startswith("cuda"),
-    )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=BATCH_SIZE,
+            shuffle=shuffle_flag,
+            sampler=train_sampler,
+            num_workers=NUM_WORKERS,
+            collate_fn=how2sign_collate_fn,
+            pin_memory=device.startswith("cuda"),
+        )
 
-    # 5) Train
-    train_loop(
-        model=model,
-        processor=processor,
-        device=device,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        ddp=ddp,
-    )
+        # rank0 eval only -> no sampler needed
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=max(1, NUM_WORKERS // 2),
+            collate_fn=how2sign_collate_fn,
+            pin_memory=device.startswith("cuda"),
+        )
 
-    cleanup_ddp()
+        # 5) Train
+        train_loop(
+            model=model,
+            processor=processor,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            ddp=ddp,
+        )
+
+    finally:
+        cleanup_ddp()
 
 
 if __name__ == "__main__":

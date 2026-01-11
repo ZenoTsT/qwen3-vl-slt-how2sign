@@ -4,7 +4,7 @@
 #SBATCH --error=logs/train_%j.err
 #SBATCH --account=tesi_ztesta
 #SBATCH --partition=boost_usr_prod
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=24:00:00
@@ -31,6 +31,6 @@ mkdir -p logs
 MASTER_PORT=$(( 20000 + RANDOM % 10000 ))
 
 torchrun \
-    --nproc_per_node=4 \
+    --nproc_per_node=2 \
     --master_port=$MASTER_PORT \
     src/training/train_qwen3vl.py

@@ -4,11 +4,14 @@
 src/training/train_qwen3vl_singlestage.py
 
 Single-stage LoRA training for Qwen3-VL on How2Sign (video->text).
-- DDP ready (torchrun)
-- OVERFIT_TEST supported (train on a fixed small subset)
-- Train/Evaluate (+ optional generation debug on rank0)
 
-Launch (example):
+- Prompting via apply_chat_template (multimodal messages: video + text)
+- Robust masking using anchor "Translation:" searched INSIDE input_ids
+- OVERFIT_TEST: fixed subset + val = same subset
+- No checkpoints / resume / early stopping
+- Clear error if torchrun requests more ranks than visible GPUs
+
+Launch examples:
   torchrun --nproc_per_node=2 src/training/train_qwen3vl_singlestage.py
 """
 
@@ -20,7 +23,7 @@ from pathlib import Path
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
-# Avoid tokenizers fork warnings/deadlocks
+# Avoid HF tokenizers fork warnings / deadlocks
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
@@ -28,7 +31,6 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torch import amp
 from tqdm import tqdm
-
 
 # ---------------------------------------------------------------------
 # PYTHONPATH: add repo root
@@ -39,11 +41,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from src.datasets.how2sign_loader import How2SignDataset, how2sign_collate_fn
-
-# >>> IMPORTANT: this MUST match your actual loader module filename <<<
-# If you truly have: src/models/qwen3vl_lora_full.py, use this:
-from src.models.qwen3vl_lora_singlestage import load_qwen3vl_full_lora
-# If instead you kept the old name, change the import accordingly.
+# Single-stage: use your stage1 loader (LoRA on base) as the only loader.
+# If you have a dedicated single-stage loader, swap this import accordingly.
+from src.models.qwen3vl_lora import load_qwen3vl_lora
 
 
 # =====================================================================
@@ -63,14 +63,14 @@ WEIGHT_DECAY = 0.01
 GRAD_ACCUM_STEPS = 16
 MAX_STEPS: Optional[int] = None
 
-# Validation (rank0 only)
+# Validation
 MAX_VAL_BATCHES = 50
 
-# Generation debug (rank0 only)
+# Generation debug (all ranks run it to keep DDP in sync; only rank0 prints)
 DO_GENERATION_EVAL = True
 GEN_EVERY_EPOCH = True
 GEN_MAX_NEW_TOKENS = 64
-GEN_NUM_EXAMPLES = 5
+GEN_NUM_EXAMPLES = 5  # total printed (rank0)
 
 # OVERFIT TEST
 OVERFIT_TEST = True
@@ -78,41 +78,41 @@ OVERFIT_N_SAMPLES = 32
 OVERFIT_SEED = 123
 
 # Logging
-LOG_EVERY = 20
+LOG_EVERY = 2
 
 
 # =====================================================================
 # DDP helpers
 # =====================================================================
-def setup_ddp() -> Dict[str, Any]:
-    """
-    Returns dict:
-      rank, world_size, local_rank, device, is_main
-    Robust against 'invalid device ordinal' when torchrun local ranks
-    don't match visible GPUs.
-    """
+def setup_ddp_if_needed() -> Dict[str, Any]:
     if not torch.cuda.is_available():
         return dict(rank=0, world_size=1, local_rank=0, device="cpu", is_main=True)
 
-    # torchrun sets these
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
+    if world_size == 1:
+        device = "cuda:0"
+        torch.cuda.set_device(0)
+        return dict(rank=0, world_size=1, local_rank=0, device=device, is_main=True)
+
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
 
-    n_gpu = torch.cuda.device_count()
-    if n_gpu <= 0:
-        return dict(rank=0, world_size=1, local_rank=0, device="cpu", is_main=True)
-
-    # If torchrun asked for more procs than visible GPUs, map safely
-    if local_rank >= n_gpu:
-        mapped = local_rank % n_gpu
-        if rank == 0:
-            print(f"[WARN] local_rank={local_rank} but only {n_gpu} GPUs visible -> mapping to {mapped}")
-        local_rank = mapped
+    n_gpus = torch.cuda.device_count()
+    if local_rank >= n_gpus:
+        # This is the "invalid device ordinal" you saw.
+        raise RuntimeError(
+            f"[DDP] local_rank={local_rank} but visible CUDA devices={n_gpus}. "
+            "Fix: launch torchrun with --nproc_per_node equal to the number of visible GPUs "
+            "(or adjust CUDA_VISIBLE_DEVICES)."
+        )
 
     torch.cuda.set_device(local_rank)
 
-    if world_size > 1:
+    # Init process group
+    # If your PyTorch supports device_id arg, it removes barrier() warnings.
+    try:
+        dist.init_process_group(backend="nccl", device_id=local_rank)
+    except TypeError:
         dist.init_process_group(backend="nccl")
 
     return dict(
@@ -129,13 +129,15 @@ def cleanup_ddp() -> None:
         dist.destroy_process_group()
 
 
-def ddp_barrier(ddp: Dict[str, Any]) -> None:
-    if ddp["world_size"] > 1 and dist.is_available() and dist.is_initialized():
-        dist.barrier()
+def ddp_all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
+    """All-reduce SUM on a scalar tensor, returns reduced tensor."""
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t
 
 
 # =====================================================================
-# Prompt + masking
+# Prompt + masking (apply_chat_template + anchor-based masking)
 # =====================================================================
 SYSTEM_PROMPT = "You are a sign language translation model."
 USER_INSTRUCTION = (
@@ -161,7 +163,6 @@ def build_messages(video_path: str, target_text: Optional[str] = None) -> List[D
 
 
 def _apply_chat_template(processor, messages, add_generation_prompt: bool) -> str:
-    # some processors expose apply_chat_template; fallback to tokenizer
     if hasattr(processor, "apply_chat_template"):
         return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
     return processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
@@ -174,31 +175,28 @@ def make_batch_inputs_and_labels(
     device: str,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
     """
-    Robust SFT masking for multimodal:
-    - build full_text (prompt + assistant target) via chat template
-    - encode with processor(videos=..., text=...)
-    - locate anchor "Translation:" inside input_ids (includes video tokens inserted by processor)
-    - mask labels up to (and including) the anchor
+    Build chat-formatted full texts (prompt + assistant target) and mask everything up to and
+    including the anchor "Translation:" located INSIDE input_ids.
     """
     full_texts: List[str] = []
     for vp, tgt in zip(videos_batch, texts_batch):
-        msg_full = build_messages(vp, target_text=tgt)
-        full_texts.append(_apply_chat_template(processor, msg_full, add_generation_prompt=False))
+        msgs = build_messages(vp, target_text=tgt)
+        full_texts.append(_apply_chat_template(processor, msgs, add_generation_prompt=False))
 
-    full_inputs = processor(
+    inputs = processor(
         videos=videos_batch,
         text=full_texts,
         return_tensors="pt",
         padding=True,
         truncation=True,
     )
-    full_inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in full_inputs.items()}
 
-    input_ids = full_inputs["input_ids"]
+    inputs = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+    input_ids = inputs["input_ids"]
+
     labels = input_ids.clone()
     ignore_index = -100
 
-    # Tokenize anchor once (no special tokens)
     anchor_ids = processor.tokenizer(
         ANCHOR_TEXT,
         add_special_tokens=False,
@@ -208,31 +206,25 @@ def make_batch_inputs_and_labels(
     B, T = input_ids.shape
     for b in range(B):
         seq = input_ids[b].tolist()
-
         start_idx = -1
         for j in range(0, T - len(anchor_ids) + 1):
             if seq[j : j + len(anchor_ids)] == anchor_ids:
                 start_idx = j
                 break
+        if start_idx != -1:
+            end_idx = start_idx + len(anchor_ids)
+            labels[b, :end_idx] = ignore_index
+        # else: fallback -> do not mask (better than masking all)
 
-        if start_idx == -1:
-            # If anchor not found, conservative fallback:
-            # mask nothing (better than masking everything)
-            continue
-
-        end_idx = start_idx + len(anchor_ids)
-        labels[b, :end_idx] = ignore_index
-
-    # mask padding tokens
     pad_id = processor.tokenizer.pad_token_id
     if pad_id is not None:
         labels[labels == pad_id] = ignore_index
 
-    return full_inputs, labels
+    return inputs, labels
 
 
 # =====================================================================
-# Generation debug (rank0 only)
+# Generation debug (all ranks run to keep DDP synchronized; only rank0 prints)
 # =====================================================================
 @torch.no_grad()
 def generate_translations(
@@ -240,15 +232,15 @@ def generate_translations(
     processor,
     device: str,
     videos: List[str],
+    max_new_tokens: int,
 ) -> List[str]:
-    # unwrap DDP for generation
     m = model.module if hasattr(model, "module") else model
     m.eval()
 
     prompts: List[str] = []
     for vp in videos:
-        msg_prompt = build_messages(vp, target_text=None)
-        prompts.append(_apply_chat_template(processor, msg_prompt, add_generation_prompt=True))
+        msgs = build_messages(vp, target_text=None)
+        prompts.append(_apply_chat_template(processor, msgs, add_generation_prompt=True))
 
     inputs = processor(
         videos=videos,
@@ -261,11 +253,11 @@ def generate_translations(
 
     gen_ids = m.generate(
         **inputs,
-        max_new_tokens=GEN_MAX_NEW_TOKENS,
+        max_new_tokens=max_new_tokens,
         do_sample=False,
     )
 
-    # Decode ONLY the generated continuation (avoid prompt echo)
+    # decode only continuation (avoid echoing prompt)
     in_len = inputs["input_ids"].shape[1]
     gen_only = gen_ids[:, in_len:] if gen_ids.shape[1] > in_len else gen_ids
     decoded = processor.tokenizer.batch_decode(gen_only, skip_special_tokens=True)
@@ -282,10 +274,10 @@ def generate_translations(
 
 
 # =====================================================================
-# Eval (rank0 only)
+# Eval (distributed-safe)
 # =====================================================================
 @torch.no_grad()
-def evaluate_loss(
+def evaluate(
     model,
     processor,
     device: str,
@@ -293,11 +285,13 @@ def evaluate_loss(
     max_batches: int,
     ddp: Dict[str, Any],
 ) -> Dict[str, float]:
-    if not ddp["is_main"]:
-        return {}
-
+    """
+    Each rank computes partial sum(loss) and count, then all-reduce to get global average.
+    """
     model.eval()
-    losses: List[float] = []
+
+    loss_sum = 0.0
+    n = 0
 
     for b_idx, batch in enumerate(loader):
         if b_idx >= max_batches:
@@ -308,14 +302,24 @@ def evaluate_loss(
 
         inputs, labels = make_batch_inputs_and_labels(processor, videos_batch, texts_batch, device)
         outputs = model(**inputs, labels=labels)
-        losses.append(float(outputs.loss.item()))
+        loss_sum += float(outputs.loss.item())
+        n += 1
+
+    # all-reduce sums
+    if ddp["world_size"] > 1:
+        t_sum = torch.tensor([loss_sum], device=device, dtype=torch.float32)
+        t_n = torch.tensor([n], device=device, dtype=torch.float32)
+        ddp_all_reduce_sum(t_sum)
+        ddp_all_reduce_sum(t_n)
+        loss_sum = float(t_sum.item())
+        n = int(t_n.item())
 
     model.train()
-    return {"loss": float(sum(losses) / max(len(losses), 1)) if losses else float("nan")}
+    return {"val_loss": (loss_sum / max(n, 1)) if n > 0 else float("nan")}
 
 
 @torch.no_grad()
-def evaluate_generation_debug(
+def evaluate_generation_debug_synchronized(
     model,
     processor,
     device: str,
@@ -323,28 +327,42 @@ def evaluate_generation_debug(
     max_batches: int,
     ddp: Dict[str, Any],
 ) -> None:
-    if not ddp["is_main"]:
-        return
-
+    """
+    To avoid DDP desync:
+    - ALL ranks run the same generation loop for the same number of batches.
+    - Only rank0 prints.
+    """
     model.eval()
-    printed = 0
+    is_main = ddp["is_main"]
 
+    printed = 0
     for b_idx, batch in enumerate(loader):
-        if b_idx >= max_batches or printed >= GEN_NUM_EXAMPLES:
+        if b_idx >= max_batches:
+            break
+        if printed >= GEN_NUM_EXAMPLES:
             break
 
         videos_batch: List[str] = batch["videos"]
         texts_batch: List[str] = batch["texts"]
 
-        preds = generate_translations(model, processor, device, videos_batch)
-        for ref, pred in zip(texts_batch, preds):
-            print("----- GEN DEBUG -----")
-            print("REF :", ref)
-            print("PRED:", pred)
-            print("---------------------\n")
-            printed += 1
-            if printed >= GEN_NUM_EXAMPLES:
-                break
+        preds = generate_translations(
+            model=model,
+            processor=processor,
+            device=device,
+            videos=videos_batch,
+            max_new_tokens=GEN_MAX_NEW_TOKENS,
+        )
+
+        # Everyone does the work, only rank0 prints
+        if is_main:
+            for ref, pred in zip(texts_batch, preds):
+                print("----- GEN DEBUG -----")
+                print("REF :", ref)
+                print("PRED:", pred)
+                print("---------------------\n")
+                printed += 1
+                if printed >= GEN_NUM_EXAMPLES:
+                    break
 
     model.train()
 
@@ -382,6 +400,7 @@ def train_loop(
 
     scaler = amp.GradScaler("cuda") if device.startswith("cuda") else None
     global_step = 0
+    running_loss = 0.0
 
     for epoch in range(1, NUM_EPOCHS + 1):
         if ddp["world_size"] > 1 and isinstance(train_loader.sampler, DistributedSampler):
@@ -391,9 +410,8 @@ def train_loop(
         optimizer.zero_grad(set_to_none=True)
 
         data_iter = tqdm(train_loader, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else train_loader
-        running_loss = 0.0
 
-        for step_in_epoch, batch in enumerate(data_iter, start=1):
+        for _, batch in enumerate(data_iter, start=1):
             global_step += 1
 
             videos_batch: List[str] = batch["videos"]
@@ -437,22 +455,28 @@ def train_loop(
                     print(f"[INFO] Reached MAX_STEPS={MAX_STEPS} -> stopping.")
                 break
 
-        # -------------------------------
-        # IMPORTANT: DDP-safe evaluation
-        # -------------------------------
-        # Barrier BEFORE eval: all ranks must reach this point
-        ddp_barrier(ddp)
-
-        # Eval/generation only on rank0
+        # ---- Distributed-safe eval (all ranks participate) ----
+        metrics = evaluate(
+            model=model,
+            processor=processor,
+            device=device,
+            loader=val_loader,
+            max_batches=MAX_VAL_BATCHES,
+            ddp=ddp,
+        )
         if is_main:
-            ev = evaluate_loss(model, processor, device, val_loader, MAX_VAL_BATCHES, ddp)
-            print(f"[EVAL] epoch={epoch} val_loss={ev.get('loss', float('nan')):.4f}")
+            print(f"[EVAL] epoch={epoch} val_loss={metrics['val_loss']:.4f}")
 
-            if DO_GENERATION_EVAL and GEN_EVERY_EPOCH:
-                evaluate_generation_debug(model, processor, device, val_loader, max_batches=MAX_VAL_BATCHES, ddp=ddp)
-
-        # Barrier AFTER eval: all ranks wait for rank0 to finish extra work
-        ddp_barrier(ddp)
+        # ---- Generation debug (all ranks run; only rank0 prints) ----
+        if DO_GENERATION_EVAL and GEN_EVERY_EPOCH:
+            evaluate_generation_debug_synchronized(
+                model=model,
+                processor=processor,
+                device=device,
+                loader=val_loader,
+                max_batches=MAX_VAL_BATCHES,
+                ddp=ddp,
+            )
 
         if MAX_STEPS is not None and global_step >= MAX_STEPS:
             break
@@ -467,9 +491,12 @@ def train_loop(
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    ddp = setup_ddp()
-    is_main = ddp["is_main"]
+    ddp = setup_ddp_if_needed()
+    rank = ddp["rank"]
+    world_size = ddp["world_size"]
+    local_rank = ddp["local_rank"]
     device = ddp["device"]
+    is_main = ddp["is_main"]
 
     if is_main:
         print("==============================================")
@@ -478,30 +505,32 @@ def main():
         print(f"[INFO] PROJECT_ROOT = {PROJECT_ROOT}")
         print(f"[INFO] DATASET_JSON  = {DATASET_JSON}")
         print(f"[INFO] OUTPUT_DIR   = {OUTPUT_DIR}")
-        print(f"[INFO] device       = {device}")
-        print(f"[INFO] world_size   = {ddp['world_size']}")
-        print(f"[INFO] OVERFIT_TEST = {OVERFIT_TEST} (n={OVERFIT_N_SAMPLES})")
+        print(f"[INFO] World size   = {world_size}")
+        print(f"[INFO] Rank/L-Rank   = {rank}/{local_rank}")
+        print(f"[INFO] Device        = {device}")
+        print(f"[INFO] OVERFIT_TEST  = {OVERFIT_TEST} (n={OVERFIT_N_SAMPLES})")
         print("==============================================\n")
 
     try:
-        # 1) Load model + processor (per-rank device)
+        # 1) Load model + processor (single-stage = stage1)
         t0 = time.time()
-        model, processor = load_qwen3vl_full_lora(
+        model, processor = load_qwen3vl_lora(
             model_name=MODEL_NAME,
             r=16,
             alpha=32,
             dropout=0.05,
             device=device,
+            stage="stage1",
         )
         if is_main:
             print(f"[TIMER] model+processor loaded in {time.time() - t0:.2f}s")
 
         # 2) DDP wrap
-        if ddp["world_size"] > 1:
+        if world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
-                device_ids=[ddp["local_rank"]],
-                output_device=ddp["local_rank"],
+                device_ids=[local_rank],
+                output_device=local_rank,
                 find_unused_parameters=False,
             )
 
@@ -528,17 +557,14 @@ def main():
         if is_main:
             print(f"[DATA] train={len(train_ds)} | val={len(val_ds)}")
 
-        # 4) Loaders
-        if ddp["world_size"] > 1:
-            train_sampler = DistributedSampler(
-                train_ds,
-                num_replicas=ddp["world_size"],
-                rank=ddp["rank"],
-                shuffle=True,
-            )
+        # 4) Samplers / Loaders
+        if world_size > 1:
+            train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+            val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
             shuffle_flag = False
         else:
             train_sampler = None
+            val_sampler = None
             shuffle_flag = True
 
         train_loader = DataLoader(
@@ -551,11 +577,11 @@ def main():
             pin_memory=device.startswith("cuda"),
         )
 
-        # rank0 eval only -> no sampler needed; still safe due to barriers
         val_loader = DataLoader(
             val_ds,
             batch_size=1,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=max(1, NUM_WORKERS // 2),
             collate_fn=how2sign_collate_fn,
             pin_memory=device.startswith("cuda"),

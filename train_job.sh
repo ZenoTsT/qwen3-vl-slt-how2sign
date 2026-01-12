@@ -33,4 +33,4 @@ MASTER_PORT=$(( 20000 + RANDOM % 10000 ))
 torchrun \
     --nproc_per_node=2 \
     --master_port=$MASTER_PORT \
-    src/training/train_qwen3vl_singlestage.py
+    src/training/train_qwen3vl.py

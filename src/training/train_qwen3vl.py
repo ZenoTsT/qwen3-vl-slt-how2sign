@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch import amp
 from tqdm import tqdm
 import time
+import random
 
 # ---------------------------------------------------------------------
 # PYTHONPATH: aggiungo la root del progetto
@@ -26,23 +27,24 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.datasets.how2sign_loader import How2SignDataset, how2sign_collate_fn
 from src.models.qwen3vl_lora import load_qwen3vl_lora
+from src.models.qwen3vl_lora_singlestage import load_qwen3vl_full_lora
 
 
 # ---------------------------------------------------------------------
 # Config di base
 # ---------------------------------------------------------------------
 MODEL_NAME = "Qwen/Qwen3-VL-4B-Instruct"
-STAGE = "stage1"  # "stage1" | "stage2"
+STAGE = "singlestage"  # "stage1" | "stage2" | "singlestage"
 
 DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
 BATCH_SIZE = 2              # effettiva
-NUM_EPOCHS = 1              # per ora smoke test
+NUM_EPOCHS = 10              # per ora smoke test
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-GRAD_ACCUM_STEPS = 16        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
-LOG_EVERY = 50              # step di logging
+GRAD_ACCUM_STEPS = 8        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
+LOG_EVERY = 8              # step di logging
 MAX_VAL_BATCHES = 50        # quante batch usare in val (per velocità)
 MAX_GEN_TOKENS = 32         # max token generati per valutazione
 MAX_STEPS = None            # se voglio fermare dopo N step globali, metto un int
@@ -51,100 +53,118 @@ RESUME_FROM_LATEST = True       # se True, prova a riprendere dall’ultimo chec
 EARLY_STOPPING_PATIENCE = 3     # numero di epoche senza miglioramento prima di fermarsi
 EARLY_STOPPING_MIN_DELTA = 0.0  # quanto deve migliorare almeno la val_loss per essere considerato "miglioramento"
 
-INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps
+INTRA_SAVE_EVERY_STEPS = 1000000    # salvo un intra step ogni 256 global steps
 
+# --- Overfit test ---
+OVERFIT_TEST = True
+OVERFIT_N_SAMPLES = 32
+OVERFIT_SEED = 123
+
+def make_overfit_subset(ds, n: int, seed: int):
+    rng = random.Random(seed)
+    idx = list(range(len(ds)))
+    rng.shuffle(idx)
+    idx = idx[: min(n, len(idx))]
+    idx.sort()
+    return torch.utils.data.Subset(ds, idx)
 
 # ---------------------------------------------------------------------
-# Prompt template
+# Prompt (chat template) + masking 
 # ---------------------------------------------------------------------
-def build_instruction_prompt() -> str:
+SYSTEM_PROMPT = "You are a sign language translation model."
+USER_INSTRUCTION = (
+    "Translate the sign language video into English.\n\n"
+    "Answer with the English sentence only.\n\n"
+    "Translation:"
+)
+ANCHOR_TEXT = "Translation:"
+
+
+def build_messages(video_path: str, target_text: str | None = None) -> List[Dict[str, Any]]:
     """
-    Prompt 'istruzione' senza la risposta.
-    Questo testo è quello che forniamo in input in fase di generazione.
+    Multimodal chat:
+      system: text
+      user:   [video + instruction text]
+      assistant (optional): target text
     """
-    
-    prompt = (
-        "You are a sign language translation model. "
-        "Given the following sign language video <|video_pad|>, "
-        "translate it into English.\n\n"
-        "Answer with the English sentence only.\n\n"
-        "Translation:"
+    user_content = [
+        {"type": "video", "video": video_path},
+        {"type": "text", "text": USER_INSTRUCTION},
+    ]
+    msgs: List[Dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    if target_text is not None:
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": target_text}]})
+    return msgs
+
+
+def _apply_chat_template(processor, messages, add_generation_prompt: bool) -> str:
+    """
+    Compat:
+    - alcuni processor hanno apply_chat_template
+    - altrimenti usare tokenizer.apply_chat_template
+    """
+    if hasattr(processor, "apply_chat_template"):
+        return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+    return processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+
+
+def make_batch_inputs_and_labels(
+    processor,
+    videos_batch: List[str],
+    texts_batch: List[str],
+    device: str,
+) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """
+    - costruisce full_text (prompt + risposta) via chat template
+    - processor(videos=..., text=...) -> input_ids con token multimodali inclusi
+    - masking: ignora tutto fino a (e incluso) "Translation:" cercato in input_ids
+    """
+    full_texts: List[str] = []
+    for vp, tgt in zip(videos_batch, texts_batch):
+        msgs_full = build_messages(vp, target_text=tgt)
+        full_texts.append(_apply_chat_template(processor, msgs_full, add_generation_prompt=False))
+
+    inputs = processor(
+        videos=videos_batch,
+        text=full_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
     )
-    
-    #
-    # DECOMMENTO PER IMMAGINI
-    #
-    
-    # N_FRAMES_PER_CLIP = 8                  # deve coincidere con n_frames_to_take
-    # IMAGE_TOKEN_STR = "<|image_pad|>"       # token placeholder immagine
+    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
 
-    # # Crea "<|image_pad|> <|image_pad|> ... (N volte)"
-    # image_tokens = " ".join([IMAGE_TOKEN_STR] * N_FRAMES_PER_CLIP)
-
-    # prompt = (
-    #     f"You are a sign language translation model. "
-    #     f"Given the following sign language video frames {image_tokens}, "
-    #     f"translate it into English.\n\n"
-    #     f"Answer with the English sentence only.\n\n"
-    #     f"Translation:"
-    # )
-    return prompt
-
-
-def build_training_text(target_text: str) -> str:
-    """
-    Testo che usiamo in training come target.
-    Qui, per semplicità, il modello deve rigenerare:
-        [istruzione + spazio + frase_target]
-    In seguito possiamo raffinarsi (loss solo sulla frase, ecc.).
-    """
-    instr = build_instruction_prompt()
-    return instr + " " + target_text.strip()
-
-def mask_prompt_tokens(labels: torch.Tensor, input_ids: torch.Tensor, processor) -> torch.Tensor:
-    """
-    Robust prompt masking for multimodal Qwen3-VL inputs.
-
-    We ignore (set to -100) everything up to and including the instruction part,
-    identified by the substring "Translation:" (tokenized), regardless of extra
-    multimodal tokens inserted by the processor (e.g., <|vision_start|>, <|video_pad|>, etc.).
-    """
-    labels = labels.clone()
+    input_ids = inputs["input_ids"]
+    labels = input_ids.clone()
     ignore_index = -100
 
-    # Tokenize the *anchor* string that marks the end of the instruction.
-    anchor_text = "Translation:"
     anchor_ids = processor.tokenizer(
-        anchor_text,
+        ANCHOR_TEXT,
         add_special_tokens=False,
         return_tensors=None,
     )["input_ids"]
 
-    if len(anchor_ids) == 0:
-        return labels
-
     B, T = input_ids.shape
-
     for b in range(B):
         seq = input_ids[b].tolist()
-
-        # Find anchor subsequence inside seq
         start_idx = -1
         for j in range(0, T - len(anchor_ids) + 1):
             if seq[j : j + len(anchor_ids)] == anchor_ids:
                 start_idx = j
                 break
 
-        if start_idx == -1:
-            # If we can't find it, do not mask (fallback).
-            continue
+        if start_idx != -1:
+            end_idx = start_idx + len(anchor_ids)
+            labels[b, :end_idx] = ignore_index
+        # fallback: se non troviamo l’anchor, non mascheriamo (meglio che mascherare tutto)
 
-        end_idx = start_idx + len(anchor_ids)
+    pad_id = processor.tokenizer.pad_token_id
+    if pad_id is not None:
+        labels[labels == pad_id] = ignore_index
 
-        # Mask everything up to the end of "Translation:" (instruction part)
-        labels[b, :end_idx] = ignore_index
-
-    return labels
+    return inputs, labels
 
 
 # ---------------------------------------------------------------------
@@ -477,33 +497,12 @@ def evaluate(model, processor, device: str, val_loader, max_batches: int, is_mai
         texts_batch = batch["texts"]       # List[str] (ground truth)
 
         # ====== 1) Loss in teacher forcing ======
-        train_texts = [build_training_text(t) for t in texts_batch]
-        # Processor converte immagini + testo in tensori. input è un dict di tensori input = {"input_ids": token del testo, "pixel_values": tensori dei frame}
-        # inputs = processor( 
-        #     images=images_batch,
-        #     text=train_texts,
-        #     return_tensors="pt",
-        #     padding=True,
-        #     truncation=True,
-        # )
-        
-        inputs = processor( 
-        videos=videos_batch,
-        text=train_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        # num_frames=16,    # Campi opzionali
-        # fps=2.0,          # Campi opzionali
+        inputs, labels = make_batch_inputs_and_labels(
+            processor=processor,
+            videos_batch=videos_batch,
+            texts_batch=texts_batch,
+            device=device,
         )
-        
-        inputs = {k: v.to(device) for k, v in inputs.items()} # sposto tutti i tensori sulla GPU corretta
-        labels = inputs["input_ids"].clone() # clono il tensore dei testi da predirre (in modo da tenerle come label)
-        labels = mask_prompt_tokens(labels, inputs["input_ids"], processor)
-        
-        pad_id = processor.tokenizer.pad_token_id
-        if pad_id is not None:
-            labels[labels == pad_id] = -100
 
         outputs = model(**inputs, labels=labels) # Forward
         losses.append(outputs.loss.item()) # memorizzo la loss
@@ -556,13 +555,19 @@ def main():
             device=device,
             stage="stage1",
         )
-    else:
+    elif STAGE == "stage2":
         model, processor = load_qwen3vl_lora(
             model_name=MODEL_NAME,
             r=16, alpha=32, dropout=0.05,
             device=device,
             stage="stage2",
             stage1_adapter_dir=str(OUTPUT_DIR / "checkpoints" / "stage1" / "epoch_best"),
+        )
+    else:
+        model, processor = load_qwen3vl_full_lora(
+            model_name=MODEL_NAME,
+            r=16, alpha=32, dropout=0.05,
+            device=device,
         )
 
     # In multi-GPU, wrappiamo in DDP (1 processo per GPU)
@@ -583,33 +588,24 @@ def main():
     # -----------------------
     # 2) Dataset + Dataloader
     # -----------------------
-    
-    # IMMAGINI
-    # train_ds = How2SignDataset(             # Costruisco un oggetto Dataset per training
-    #     json_path=str(DATASET_JSON),
-    #     split="train",
-    #     root_dir=str(PROJECT_ROOT),
-    #     n_frames_to_take=8,
-    # )
-    # val_ds = How2SignDataset(               # Costruisco un oggetto Dataset per validation
-    #     json_path=str(DATASET_JSON),
-    #     split="val",
-    #     root_dir=str(PROJECT_ROOT),
-    #     n_frames_to_take=8,
-    # )
-    
-    train_ds = How2SignDataset(             # Costruisco un oggetto Dataset per training
+    train_ds_full = How2SignDataset(
         json_path=str(DATASET_JSON),
         split="train",
         root_dir=str(PROJECT_ROOT),
-        return_type="video",    
-    )
-    val_ds = How2SignDataset(             
-        json_path=str(DATASET_JSON),
-        split="val",
-        root_dir=str(PROJECT_ROOT),
         return_type="video",
     )
+
+    if OVERFIT_TEST:
+        train_ds = make_overfit_subset(train_ds_full, OVERFIT_N_SAMPLES, OVERFIT_SEED)
+        val_ds = train_ds
+    else:
+        train_ds = train_ds_full
+        val_ds = How2SignDataset(
+            json_path=str(DATASET_JSON),
+            split="val",
+            root_dir=str(PROJECT_ROOT),
+            return_type="video",
+        )
 
     if is_main_process:
         print(f"[INFO] Train examples: {len(train_ds)}")
@@ -776,51 +772,22 @@ def main():
             videos_batch = batch["videos"]  # List[str] (path ai video)
             texts_batch = batch["texts"]    # List[str]
 
-            # Testo di training = istruzione + frase target
-            full_texts = [build_training_text(t) for t in texts_batch]
-            
             # >>> DEBUG: tempo processor (decoding + preprocess)
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-            # Processor converte immagini + testo in tensori. input è un dict di tensori input = {"input_ids": token del testo, "pixel_values": tensori dei frame}
-            inputs = processor(
-                # images=images_batch,
-                videos=videos_batch,
-                text=full_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                # num_frames=16,    # campi opzionali
-                # fps=2.0,          # campi opzionali
+            inputs, labels = make_batch_inputs_and_labels(
+                processor=processor,
+                videos_batch=videos_batch,
+                texts_batch=texts_batch,
+                device=device,
             )
             
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
             t1 = time.perf_counter()
             prep_time = t1 - t0
-            # <<< DEBUG
-            
-            # >>> DEBUG: shape tensori al primo step
-            if is_main_process and global_step == 1:
-                print("[DEBUG] processor output keys:", inputs.keys())
-                for k, v in inputs.items():
-                    if isinstance(v, torch.Tensor):
-                        print(f"[DEBUG] inputs[{k}].shape = {tuple(v.shape)}")
-                if "pixel_values_videos" in inputs:
-                    print(
-                        "[DEBUG] pixel_values_videos shape:",
-                        tuple(inputs["pixel_values_videos"].shape),
-                    )
-            # <<< DEBUG
-            
-            inputs = {k: v.to(device) for k, v in inputs.items()} # sposto tutti i tensori sulla GPU corretta
-            labels = inputs["input_ids"].clone() # clono il tensore dei testi da predirre (in modo da tenerle come label)
-            labels = mask_prompt_tokens(labels, inputs["input_ids"], processor)
-            pad_id = processor.tokenizer.pad_token_id
-            if pad_id is not None:
-                labels[labels == pad_id] = -100
 
             # Attivo autocast (modalità di PyTorch che abilita il mixed precision, FP16 dove è sicuro, FP32 dove serve più precisione)
             if device.startswith("cuda"): # solo su GPU
@@ -943,6 +910,19 @@ def main():
             output_dir=OUTPUT_DIR,
             is_main_process=is_main_process,
         )
+        
+        log_generation_examples(
+            model=model,
+            processor=processor,
+            device=device,
+            val_loader=val_loader,
+            n_examples=5,
+            max_new_tokens=MAX_GEN_TOKENS,
+            is_main_process=is_main_process,
+        )
+        
+        if world_size > 1:
+            dist.barrier()
 
         # ===== Checkpoint + early stopping (solo main process) =====
         stop_training = False
@@ -1023,6 +1003,69 @@ def main():
 
     cleanup_ddp()
 
+@torch.no_grad()
+def generate_translations(model, processor, device: str, videos: List[str], max_new_tokens: int) -> List[str]:
+    m = model.module if hasattr(model, "module") else model
+    m.eval()
+
+    prompts: List[str] = []
+    for vp in videos:
+        msgs = build_messages(vp, target_text=None)
+        prompts.append(_apply_chat_template(processor, msgs, add_generation_prompt=True))
+
+    inputs = processor(
+        videos=videos,
+        text=prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    )
+    inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+
+    gen_ids = m.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+    )
+
+    in_len = inputs["input_ids"].shape[1]
+    gen_only = gen_ids[:, in_len:] if gen_ids.shape[1] > in_len else gen_ids
+    decoded = processor.tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
+    cleaned = []
+    for s in decoded:
+        s2 = s.strip()
+        if "\n" in s2:
+            parts = [p.strip() for p in s2.split("\n") if p.strip()]
+            if parts:
+                s2 = parts[-1]
+        cleaned.append(s2)
+    return cleaned
+
+
+@torch.no_grad()
+def log_generation_examples(model, processor, device: str, val_loader, n_examples: int, max_new_tokens: int, is_main_process: bool):
+    if not is_main_process:
+        return
+
+    model.eval()
+    printed = 0
+    for batch in val_loader:
+        videos_batch = batch["videos"]
+        texts_batch = batch["texts"]
+
+        preds = generate_translations(model, processor, device, videos_batch, max_new_tokens=max_new_tokens)
+        for ref, pred in zip(texts_batch, preds):
+            print("----- GEN DEBUG -----")
+            print("REF :", ref)
+            print("PRED:", pred)
+            print("---------------------\n")
+            printed += 1
+            if printed >= n_examples:
+                model.train()
+                return
+
+    model.train()
 
 if __name__ == "__main__":
     main()

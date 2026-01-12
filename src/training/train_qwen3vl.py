@@ -43,17 +43,20 @@ BATCH_SIZE = 2              # effettiva
 NUM_EPOCHS = 10              # per ora smoke test
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-GRAD_ACCUM_STEPS = 8        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
+GRAD_ACCUM_STEPS = 16        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
 LOG_EVERY = 8              # step di logging
 MAX_VAL_BATCHES = 50        # quante batch usare in val (per velocità)
-MAX_GEN_TOKENS = 32         # max token generati per valutazione
+MAX_GEN_TOKENS = 128         # max token generati per valutazione
 MAX_STEPS = None            # se voglio fermare dopo N step globali, metto un int
 
 RESUME_FROM_LATEST = True       # se True, prova a riprendere dall’ultimo checkpoint
 EARLY_STOPPING_PATIENCE = 3     # numero di epoche senza miglioramento prima di fermarsi
 EARLY_STOPPING_MIN_DELTA = 0.0  # quanto deve migliorare almeno la val_loss per essere considerato "miglioramento"
 
-INTRA_SAVE_EVERY_STEPS = 1000000    # salvo un intra step ogni 256 global steps
+INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps
+NUM_WORKERS = 4            
+GEN_EVERY_STEPS = 512
+GEN_N_EXAMPLES = 3   
 
 # --- Overfit test ---
 OVERFIT_TEST = True
@@ -627,7 +630,7 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=shuffle_flag,       # mischia i sample prima di costruire il batch
         sampler=train_sampler,      # distribuisce i sample (eventualmente su più GPU)
-        num_workers=4,
+        num_workers=NUM_WORKERS,
         collate_fn=how2sign_collate_fn,     # funzione di batching personalizzata (dizionari non tensori)
         pin_memory=True,            # accelera il trasferimento CPU->GPU
     )
@@ -636,7 +639,7 @@ def main():
         batch_size=1,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=2,
+        num_workers=NUM_WORKERS,
         collate_fn=how2sign_collate_fn,
         pin_memory=True,
     )
@@ -849,6 +852,23 @@ def main():
                         is_main_process=is_main_process,
                     )
                     # ------------------------------------------------------------
+                    
+                # ---- quick qualitative check every GEN_EVERY_STEPS (rank0 only) ----
+                if is_main_process and (global_step % GEN_EVERY_STEPS == 0):
+                    log_generation_examples(
+                        model=model,
+                        processor=processor,
+                        device=device,
+                        val_loader=val_loader,
+                        n_examples=GEN_N_EXAMPLES,
+                        max_new_tokens=MAX_GEN_TOKENS,
+                        is_main_process=is_main_process,
+                    )
+                    model.train()
+
+                    # (opzionale) barriera per riallineare i rank in DDP
+                    if world_size > 1:
+                        dist.barrier()
 
             # >>> DEBUG: log tempi ogni LOG_EVERY step
             if is_main_process and (global_step % LOG_EVERY == 0):
@@ -916,7 +936,7 @@ def main():
             processor=processor,
             device=device,
             val_loader=val_loader,
-            n_examples=5,
+            n_examples=GEN_N_EXAMPLES,
             max_new_tokens=MAX_GEN_TOKENS,
             is_main_process=is_main_process,
         )
@@ -1028,9 +1048,13 @@ def generate_translations(model, processor, device: str, videos: List[str], max_
         do_sample=False,
     )
 
-    in_len = inputs["input_ids"].shape[1]
-    gen_only = gen_ids[:, in_len:] if gen_ids.shape[1] > in_len else gen_ids
-    decoded = processor.tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+    attn = inputs["attention_mask"]
+    prompt_lens = attn.sum(dim=1).tolist()  # length reale per sample
+
+    decoded = []
+    for i, plen in enumerate(prompt_lens):
+        gen_only_i = gen_ids[i, plen:]
+        decoded.append(processor.tokenizer.decode(gen_only_i, skip_special_tokens=True).strip())
 
     cleaned = []
     for s in decoded:

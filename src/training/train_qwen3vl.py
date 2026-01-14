@@ -53,8 +53,7 @@ RESUME_FROM_LATEST = True       # se True, prova a riprendere dall’ultimo chec
 EARLY_STOPPING_PATIENCE = 3     # numero di epoche senza miglioramento prima di fermarsi
 EARLY_STOPPING_MIN_DELTA = 0.0  # quanto deve migliorare almeno la val_loss per essere considerato "miglioramento"
 
-INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps
-NUM_WORKERS = 4            
+INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps         
 GEN_EVERY_STEPS = 512
 GEN_N_EXAMPLES = 3   
 
@@ -630,7 +629,7 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=shuffle_flag,       # mischia i sample prima di costruire il batch
         sampler=train_sampler,      # distribuisce i sample (eventualmente su più GPU)
-        num_workers=NUM_WORKERS,
+        num_workers=0,
         collate_fn=how2sign_collate_fn,     # funzione di batching personalizzata (dizionari non tensori)
         pin_memory=True,            # accelera il trasferimento CPU->GPU
     )
@@ -639,7 +638,7 @@ def main():
         batch_size=1,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=NUM_WORKERS,
+        num_workers=0,
         collate_fn=how2sign_collate_fn,
         pin_memory=True,
     )
@@ -865,10 +864,6 @@ def main():
                         is_main_process=is_main_process,
                     )
                     model.train()
-
-                    # (opzionale) barriera per riallineare i rank in DDP
-                    if world_size > 1:
-                        dist.barrier()
 
             # >>> DEBUG: log tempi ogni LOG_EVERY step
             if is_main_process and (global_step % LOG_EVERY == 0):

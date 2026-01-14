@@ -6,6 +6,7 @@ import json
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Any, List
+import math
 
 import torch
 import torch.distributed as dist
@@ -55,7 +56,7 @@ EARLY_STOPPING_MIN_DELTA = 0.0  # quanto deve migliorare almeno la val_loss per 
 
 INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps         
 GEN_EVERY_STEPS = 512
-GEN_N_EXAMPLES = 3   
+GEN_N_EXAMPLES = 4 
 
 # --- Overfit test ---
 OVERFIT_TEST = True
@@ -475,30 +476,28 @@ def log_epoch_metrics(epoch: int, global_step: int, metrics: Dict[str, float], o
 # Evaluation
 # ---------------------------------------------------------------------
 @torch.no_grad()
-def evaluate(model, processor, device: str, val_loader, max_batches: int, is_main_process: bool) -> Dict[str, float]:
+def evaluate(model, processor, device: str, val_loader, max_batches: int) -> Dict[str, float]:
     """
     Valutazione:
         - val_loss (teacher forcing)
 
     Per semplicità, valutiamo solo su un sottoinsieme di batch (max_batches).
     """
-    # In DDP, facciamo la valutazione solo sul rank 0, per semplicità.
-    # Se volessimo fare average tra rank, dovremmo fare all_reduce.
-    if not is_main_process:
-        return {}
-
     model.eval()
-    losses = []
 
-    for b_idx, batch in enumerate(val_loader):  # per ogni batch, batch = {"images": ..., "texts": ..., "meta": ...}
-        if b_idx >= max_batches:
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    local_max = None if max_batches is None else int(math.ceil(max_batches / world_size))
+
+    loss_sum = 0.0
+    count = 0
+
+    for b_idx, batch in enumerate(val_loader):
+        if local_max is not None and b_idx >= local_max:
             break
 
-        #images_batch = batch["images"]     # List[List[PIL.Image]] 
-        videos_batch = batch["videos"]     # List[str] (path ai video) in modalità "video"
-        texts_batch = batch["texts"]       # List[str] (ground truth)
+        videos_batch = batch["videos"]
+        texts_batch = batch["texts"]
 
-        # ====== 1) Loss in teacher forcing ======
         inputs, labels = make_batch_inputs_and_labels(
             processor=processor,
             videos_batch=videos_batch,
@@ -506,21 +505,24 @@ def evaluate(model, processor, device: str, val_loader, max_batches: int, is_mai
             device=device,
         )
 
-        outputs = model(**inputs, labels=labels) # Forward
-        losses.append(outputs.loss.item()) # memorizzo la loss
+        outputs = model(**inputs, labels=labels)
+        loss_sum += float(outputs.loss.item())
+        count += 1
 
-    # aggrego risultati
-    if not losses:
-        avg_loss = float("nan")
+    # riduzione globale
+    if dist.is_available() and dist.is_initialized():
+        t = torch.tensor([loss_sum, count], device=device, dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        loss_sum_global = float(t[0].item())
+        count_global = int(t[1].item())
     else:
-        avg_loss = float(sum(losses) / len(losses))
+        loss_sum_global = loss_sum
+        count_global = count
 
-    metrics = {
-        "val_loss": avg_loss,
-    }
+    avg_loss = loss_sum_global / max(count_global, 1)
 
     model.train()
-    return metrics
+    return {"val_loss": avg_loss}
 
 
 # ---------------------------------------------------------------------
@@ -578,7 +580,7 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,                       # non tutti i parametri vengono utilizzati in forward
+            find_unused_parameters=False,                       # non tutti i parametri vengono utilizzati in forward
         )
 
     # GradScaler
@@ -615,9 +617,13 @@ def main():
 
     # In DDP, utilizziamo DistributedSampler per dividere il dataset tra i processi
     if world_size > 1:
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)  # creo i distributori di sample su piu GPU
-        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)     
-        shuffle_flag = False  # con sampler, shuffle=False nel DataLoader
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
+        )
+        val_sampler = DistributedSampler(
+            val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+        )
+        shuffle_flag = False
     else:
         train_sampler = None
         val_sampler = None
@@ -852,14 +858,17 @@ def main():
                     )
                     # ------------------------------------------------------------
                     
-                # ---- quick qualitative check every GEN_EVERY_STEPS (rank0 only) ----
-                if is_main_process and (global_step % GEN_EVERY_STEPS == 0):
+                # ---- quick qualitative check every GEN_EVERY_STEPS ----
+                if global_step % GEN_EVERY_STEPS == 0:
+                    if world_size > 1 and val_sampler is not None:
+                        val_sampler.set_epoch(epoch)
+                    
                     log_generation_examples(
                         model=model,
                         processor=processor,
                         device=device,
                         val_loader=val_loader,
-                        n_examples=GEN_N_EXAMPLES,
+                        n_examples_total=GEN_N_EXAMPLES,   
                         max_new_tokens=MAX_GEN_TOKENS,
                         is_main_process=is_main_process,
                     )
@@ -892,23 +901,32 @@ def main():
                 break
 
         # ===== Fine epoca: valutazione =====
+        if world_size > 1 and val_sampler is not None:
+            val_sampler.set_epoch(epoch)
+        
         metrics = evaluate(
             model=model,
             processor=processor,
             device=device,
             val_loader=val_loader,
             max_batches=MAX_VAL_BATCHES,
-            is_main_process=is_main_process,
         )
         
-        # Loss media di training per l'epoca (sui batch visti da questo processo)
-        if epoch_loss_count > 0:
-            avg_train_loss_epoch = epoch_loss_sum / epoch_loss_count
-        else:
-            avg_train_loss_epoch = float("nan")
+        # ---- train_loss globale (somma su tutti i rank) ----
+        train_sum = float(epoch_loss_sum)
+        train_cnt = int(epoch_loss_count)
 
-        # Aggiungo la train_loss media per l'epoca alle metriche
+        if dist.is_available() and dist.is_initialized():
+            t = torch.tensor([train_sum, train_cnt], device=device, dtype=torch.float64)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            train_sum = float(t[0].item())
+            train_cnt = int(t[1].item())
+
+         # Aggiungo la train_loss media per l'epoca alle metriche
+        avg_train_loss_epoch = train_sum / max(train_cnt, 1)
         metrics["train_loss"] = avg_train_loss_epoch
+
+       
 
         if is_main_process:
             val_loss = metrics.get("val_loss", float("inf"))
@@ -931,7 +949,7 @@ def main():
             processor=processor,
             device=device,
             val_loader=val_loader,
-            n_examples=GEN_N_EXAMPLES,
+            n_examples_total=GEN_N_EXAMPLES,  
             max_new_tokens=MAX_GEN_TOKENS,
             is_main_process=is_main_process,
         )
@@ -1061,26 +1079,70 @@ def generate_translations(model, processor, device: str, videos: List[str], max_
 
 
 @torch.no_grad()
-def log_generation_examples(model, processor, device: str, val_loader, n_examples: int, max_new_tokens: int, is_main_process: bool):
-    if not is_main_process:
-        return
+def log_generation_examples(
+    model,
+    processor,
+    device: str,
+    val_loader,
+    n_examples_total: int,
+    max_new_tokens: int,
+    is_main_process: bool,
+):
+    """
+    Distributed generation:
+      - ogni rank genera su ~n_examples_total/world_size esempi del proprio shard
+      - poi all_gather_object e stampa su rank0
+    """
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    n_per_rank = int(math.ceil(n_examples_total / world_size))
 
     model.eval()
-    printed = 0
+
+    local_pairs = []
     for batch in val_loader:
         videos_batch = batch["videos"]
         texts_batch = batch["texts"]
 
-        preds = generate_translations(model, processor, device, videos_batch, max_new_tokens=max_new_tokens)
+        preds = generate_translations(
+            model=model,
+            processor=processor,
+            device=device,
+            videos=videos_batch,
+            max_new_tokens=max_new_tokens,
+        )
+
         for ref, pred in zip(texts_batch, preds):
+            local_pairs.append((ref, pred))
+            if len(local_pairs) >= n_per_rank:
+                break
+
+        if len(local_pairs) >= n_per_rank:
+            break
+
+    # gather su rank0
+    if dist.is_initialized():
+        gathered = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered, local_pairs)  # list of lists
+    else:
+        gathered = [local_pairs]
+
+    if is_main_process:
+        # flatten e taglia al totale richiesto
+        flat = []
+        for r, pairs in enumerate(gathered):
+            for ref, pred in pairs:
+                flat.append((r, ref, pred))
+
+        flat = flat[:n_examples_total]
+
+        for r, ref, pred in flat:
             print("----- GEN DEBUG -----")
+            print(f"RANK {r}")
             print("REF :", ref)
             print("PRED:", pred)
             print("---------------------\n")
-            printed += 1
-            if printed >= n_examples:
-                model.train()
-                return
 
     model.train()
 

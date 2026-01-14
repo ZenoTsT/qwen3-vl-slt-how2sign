@@ -936,8 +936,6 @@ def main():
             is_main_process=is_main_process,
         )
         
-        if world_size > 1:
-            dist.barrier()
 
         # ===== Checkpoint + early stopping (solo main process) =====
         stop_training = False

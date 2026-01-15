@@ -41,12 +41,12 @@ DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
 BATCH_SIZE = 2              # effettiva
-NUM_EPOCHS = 40              # per ora smoke test
+NUM_EPOCHS = 10              # per ora smoke test
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-GRAD_ACCUM_STEPS = 4        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
-LOG_EVERY = 8              # step di logging
-MAX_VAL_BATCHES = 50        # quante batch usare in val (per velocità)
+GRAD_ACCUM_STEPS = 16        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
+LOG_EVERY = 512              # step di logging
+MAX_VAL_BATCHES = 64        # quante batch usare in val (per velocità)
 MAX_GEN_TOKENS = 128         # max token generati per valutazione
 MAX_STEPS = None            # se voglio fermare dopo N step globali, metto un int
 
@@ -56,10 +56,10 @@ EARLY_STOPPING_MIN_DELTA = 0.0  # quanto deve migliorare almeno la val_loss per 
 
 INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps         
 GEN_EVERY_STEPS = 512
-GEN_N_EXAMPLES = 4 
+GEN_N_EXAMPLES = 8
 
 # --- Overfit test ---
-OVERFIT_TEST = True
+OVERFIT_TEST = False
 OVERFIT_N_SAMPLES = 32
 OVERFIT_SEED = 123
 
@@ -635,7 +635,7 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=shuffle_flag,       # mischia i sample prima di costruire il batch
         sampler=train_sampler,      # distribuisce i sample (eventualmente su più GPU)
-        num_workers=0,
+        num_workers=2,
         collate_fn=how2sign_collate_fn,     # funzione di batching personalizzata (dizionari non tensori)
         pin_memory=True,            # accelera il trasferimento CPU->GPU
     )
@@ -644,7 +644,7 @@ def main():
         batch_size=1,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=0,
+        num_workers=2,
         collate_fn=how2sign_collate_fn,
         pin_memory=True,
     )

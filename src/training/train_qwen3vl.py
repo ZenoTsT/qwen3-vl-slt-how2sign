@@ -41,17 +41,17 @@ DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
 BATCH_SIZE = 2              # effettiva
-NUM_EPOCHS = 10              # per ora smoke test
+NUM_EPOCHS = 40              # per ora smoke test
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-GRAD_ACCUM_STEPS = 16        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
+GRAD_ACCUM_STEPS = 4        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
 LOG_EVERY = 8              # step di logging
 MAX_VAL_BATCHES = 50        # quante batch usare in val (per velocità)
 MAX_GEN_TOKENS = 128         # max token generati per valutazione
 MAX_STEPS = None            # se voglio fermare dopo N step globali, metto un int
 
 RESUME_FROM_LATEST = True       # se True, prova a riprendere dall’ultimo checkpoint
-EARLY_STOPPING_PATIENCE = 3     # numero di epoche senza miglioramento prima di fermarsi
+EARLY_STOPPING_PATIENCE = 100     # numero di epoche senza miglioramento prima di fermarsi
 EARLY_STOPPING_MIN_DELTA = 0.0  # quanto deve migliorare almeno la val_loss per essere considerato "miglioramento"
 
 INTRA_SAVE_EVERY_STEPS = 256    # salvo un intra step ogni 256 global steps         

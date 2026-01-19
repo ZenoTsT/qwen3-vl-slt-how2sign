@@ -498,12 +498,33 @@ def evaluate(model, processor, device: str, val_loader, max_batches: int) -> Dic
         videos_batch = batch["videos"]
         texts_batch = batch["texts"]
 
-        inputs, labels = make_batch_inputs_and_labels(
-            processor=processor,
-            videos_batch=videos_batch,
-            texts_batch=texts_batch,
-            device=device,
-        )
+        skip = 0
+        err_msg = None
+        try:
+            inputs, labels = make_batch_inputs_and_labels(
+                processor=processor,
+                videos_batch=videos_batch,
+                texts_batch=texts_batch,
+                device=device,
+            )
+        except ValueError as e:
+            msg = str(e)
+            if ("temporal_factor" in msg) or ("must be larger" in msg and "t:" in msg):
+                skip = 1
+                err_msg = msg
+            else:
+                raise
+
+        if dist.is_available() and dist.is_initialized():
+            skip_t = torch.tensor(skip, device=device, dtype=torch.int32)
+            dist.all_reduce(skip_t, op=dist.ReduceOp.MAX)
+            skip = int(skip_t.item())
+
+        if skip:
+            if dist.is_available() and dist.is_initialized():
+                # (opzionale) allineamento: tutti fanno la stessa cosa
+                pass
+            continue
 
         outputs = model(**inputs, labels=labels)
         loss_sum += float(outputs.loss.item())
@@ -785,12 +806,43 @@ def main():
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-            inputs, labels = make_batch_inputs_and_labels(
-                processor=processor,
-                videos_batch=videos_batch,
-                texts_batch=texts_batch,
-                device=device,
-            )
+            # --- DDP-safe skip per video "rotto" (es. t=1 frame) ---
+            skip = 0
+            err_msg = None
+
+            try:
+                inputs, labels = make_batch_inputs_and_labels(
+                    processor=processor,
+                    videos_batch=videos_batch,
+                    texts_batch=texts_batch,
+                    device=device,
+                )
+            except ValueError as e:
+                msg = str(e)
+                # caso tipico: "t:1 must be larger than temporal_factor:2"
+                if ("temporal_factor" in msg) or ("must be larger" in msg and "t:" in msg):
+                    skip = 1
+                    err_msg = msg
+                else:
+                    raise  # altri ValueError li vogliamo vedere subito
+
+            # sincronizzo lo "skip" tra rank (se uno deve skip, skippano tutti)
+            if dist.is_available() and dist.is_initialized():
+                skip_t = torch.tensor(skip, device=device, dtype=torch.int32)
+                dist.all_reduce(skip_t, op=dist.ReduceOp.MAX)
+                skip = int(skip_t.item())
+
+            if skip:
+                if is_main_process:
+                    print(f"[WARN] Skipping batch due to video preprocess error: {err_msg}")
+                    # stampo anche i path (molto utile per blacklisting)
+                    print(f"[WARN] videos_batch={videos_batch}")
+                # IMPORTANTISSIMO: NON fare backward/step su alcuni rank e non su altri
+                if device.startswith("cuda"):
+                    torch.cuda.synchronize()
+                t_prev = time.perf_counter()
+                continue
+            # --- fine DDP-safe skip ---
             
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
@@ -808,6 +860,7 @@ def main():
                 loss = outputs.loss                         # loss
                 # gradient accumulation: faccio media sui GRAD_ACCUM_STEPS
                 loss = loss / GRAD_ACCUM_STEPS              # siccome il “batch effettivo” è più grande di quello che entra in GPU
+    
 
             # backward con o senza scaler
             if scaler is not None:
@@ -830,6 +883,10 @@ def main():
 
             # Se sono arrivato al batch size effettivo ottimizzo il gradiente accumulato (sempre con o senza scaler)
             if global_step % GRAD_ACCUM_STEPS == 0:
+                
+                if is_main_process:
+                    print(f"[update {global_step // GRAD_ACCUM_STEPS}] last_micro_loss={loss.item() * GRAD_ACCUM_STEPS:.4f}")
+                
                 if scaler is not None:
                     scaler.unscale_(optimizer)          
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # evita esplosioni di gradiente
@@ -941,16 +998,6 @@ def main():
             global_step=global_step,
             metrics=metrics,
             output_dir=OUTPUT_DIR,
-            is_main_process=is_main_process,
-        )
-        
-        log_generation_examples(
-            model=model,
-            processor=processor,
-            device=device,
-            val_loader=val_loader,
-            n_examples_total=GEN_N_EXAMPLES,  
-            max_new_tokens=MAX_GEN_TOKENS,
             is_main_process=is_main_process,
         )
         
@@ -1105,13 +1152,31 @@ def log_generation_examples(
         videos_batch = batch["videos"]
         texts_batch = batch["texts"]
 
-        preds = generate_translations(
-            model=model,
-            processor=processor,
-            device=device,
-            videos=videos_batch,
-            max_new_tokens=max_new_tokens,
-        )
+        skip = 0
+        try:
+            preds = generate_translations(
+                model=model,
+                processor=processor,
+                device=device,
+                videos=videos_batch,
+                max_new_tokens=max_new_tokens,
+            )
+        except ValueError as e:
+            msg = str(e)
+            if ("temporal_factor" in msg) or ("must be larger" in msg and "t:" in msg):
+                skip = 1
+                preds = [""] * len(texts_batch)
+            else:
+                raise
+
+        if dist.is_initialized():
+            skip_t = torch.tensor(skip, device=device, dtype=torch.int32)
+            dist.all_reduce(skip_t, op=dist.ReduceOp.MAX)
+            skip = int(skip_t.item())
+
+        if skip:
+            # se uno skippa, skippano tutti quel batch e passano al prossimo
+            continue
 
         for ref, pred in zip(texts_batch, preds):
             local_pairs.append((ref, pred))

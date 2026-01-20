@@ -21,6 +21,8 @@ cd /homes/ztesta/qwen3-vl-slt-how2sign
 # Rendo la root del progetto visibile a Python
 export PYTHONPATH=/homes/ztesta/qwen3-vl-slt-how2sign:$PYTHONPATH
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Creo la cartella logs se non esiste
 mkdir -p logs
 

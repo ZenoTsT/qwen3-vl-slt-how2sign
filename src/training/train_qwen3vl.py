@@ -40,11 +40,11 @@ STAGE = "singlestage"  # "stage1" | "stage2" | "singlestage"
 DATASET_JSON = PROJECT_ROOT / "data/How2Sign_resized/how2sign_dataset.json"
 OUTPUT_DIR = PROJECT_ROOT / "outputs/qwen3vl_lora_how2sign"
 
-BATCH_SIZE = 2              # effettiva
+BATCH_SIZE = 1              # effettiva
 NUM_EPOCHS = 10              # per ora smoke test
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-GRAD_ACCUM_STEPS = 16        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
+GRAD_ACCUM_STEPS = 32        # gradient accumulation (effettivo batch = BATCH_SIZE * GRAD_ACCUM_STEPS)
 LOG_EVERY = 512              # step di logging
 MAX_VAL_BATCHES = 64        # quante batch usare in val (per velocità)
 MAX_GEN_TOKENS = 128         # max token generati per valutazione
